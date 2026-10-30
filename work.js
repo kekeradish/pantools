@@ -14,6 +14,42 @@ export default {
 
     const path = url.pathname.replace(/^\/+|\/+$/g, "");
 
+    // 统一获取北京时间（UTC+8）日期字符串（格式：YYYY-MM-DD），彻底杜绝 Cloudflare Workers 默认 UTC 导致的早 8 点前时区漂移与数据不客观
+    function getBeijingDateStr(d = new Date()) {
+      const beijingTime = new Date(d.getTime() + 8 * 3600 * 1000);
+      return beijingTime.toISOString().slice(0, 10);
+    }
+
+    // 科学客观的渠道归因探测引擎（URL 推广参数 > 客户端 User-Agent 特征 > Referer 来源）
+    function detectSourceChannel(req, requestUrl) {
+      try {
+        // 1. 推广链接参数最高优先级（支持 ?s=wx, ?channel=twitter, ?from=wechat 等）
+        const paramSource = (
+          requestUrl.searchParams.get("s") || 
+          requestUrl.searchParams.get("src") || 
+          requestUrl.searchParams.get("channel") || 
+          requestUrl.searchParams.get("from") || ""
+        ).toLowerCase();
+        if (paramSource.includes("wx") || paramSource.includes("weixin") || paramSource.includes("wechat") || paramSource.includes("gzh")) return "wechat";
+        if (paramSource.includes("x") || paramSource.includes("twitter") || paramSource.includes("tw")) return "twitter";
+        if (paramSource.includes("qq")) return "qq";
+        if (paramSource.includes("direct")) return "direct";
+
+        // 2. 客户端 User-Agent 特征优先识别（微信/QQ内经常不带 Referer，防止被误判为 direct）
+        const ua = (req.headers.get("user-agent") || "").toLowerCase();
+        if (ua.includes("micromessenger")) return "wechat";
+        if (ua.includes("qq/")) return "qq";
+
+        // 3. Referer 来源域名识别
+        const referer = (req.headers.get("referer") || "").toLowerCase();
+        if (!referer) return "direct";
+        if (referer.includes("t.co") || referer.includes("x.com") || referer.includes("twitter.com")) return "twitter";
+        if (referer.includes("weixin.qq.com") || referer.includes("mp.weixin.qq.com")) return "wechat";
+        if (referer.includes("qq.com")) return "qq";
+      } catch (e) {}
+      return "other";
+    }
+
     // 登录验证接口（内置企业级防暴力破解与 IP 锁定机制）
     if (path === "api/login" && request.method === "POST") {
       try {
@@ -80,22 +116,55 @@ export default {
       });
     }
 
-    // API：接收落地页真实转存与动作埋点上报（免密轻量接口，内置物理上限防刷保护）
+    // API：接收落地页真实转存与动作埋点上报（免密轻量接口，内置物理上限防刷与天/渠道精细归因）
     if (path === "api/action" && request.method === "POST") {
       try {
         const body = await request.json();
         const slug = (body && body.slug || "").trim();
+        const srcChannel = (body && body.source || "direct").trim();
+        const todayDate = getBeijingDateStr();
+
         if (slug && env.DB) {
           try {
-            // 使用 MIN(clicks, convert_clicks + 1) 确保物理真实上限：转存数绝不可能超过累计点击量！
-            await env.DB.prepare("UPDATE links SET convert_clicks = MIN(clicks, convert_clicks + 1) WHERE slug = ?").bind(slug).run();
-          } catch (colErr) {
-            // 若数据库尚未加列，自动动态平滑增列并重试
+            // 确保表结构包含转存与天维度列（自适应静默热补齐）
             try {
               await env.DB.prepare("ALTER TABLE links ADD COLUMN convert_clicks INTEGER DEFAULT 0").run();
-              await env.DB.prepare("UPDATE links SET convert_clicks = MIN(clicks, convert_clicks + 1) WHERE slug = ?").bind(slug).run();
-            } catch (alterErr) {}
-          }
+            } catch (e) {}
+            try {
+              await env.DB.prepare("ALTER TABLE links ADD COLUMN today_clicks INTEGER DEFAULT 0").run();
+              await env.DB.prepare("ALTER TABLE links ADD COLUMN today_uv INTEGER DEFAULT 0").run();
+              await env.DB.prepare("ALTER TABLE links ADD COLUMN today_convert INTEGER DEFAULT 0").run();
+              await env.DB.prepare("ALTER TABLE links ADD COLUMN today_date TEXT DEFAULT ''").run();
+              await env.DB.prepare("ALTER TABLE links ADD COLUMN source_wechat INTEGER DEFAULT 0").run();
+            } catch (e) {}
+
+            const row = await env.DB.prepare("SELECT clicks, convert_clicks, today_clicks, today_convert, today_date, daily_json FROM links WHERE slug = ?").bind(slug).first();
+            if (row) {
+              let daily = {};
+              try { daily = row.daily_json ? JSON.parse(row.daily_json) : {}; } catch (e) {}
+              if (!daily[todayDate]) {
+                daily[todayDate] = { clicks: 1, uv: 1, convert: 0, mobile: 0, pc: 0, sources: {}, convert_sources: {} };
+              }
+              if (!daily[todayDate].convert_sources) daily[todayDate].convert_sources = {};
+
+              const dayClicks = Math.max(1, daily[todayDate].clicks || 1);
+              daily[todayDate].convert = Math.min(dayClicks, (daily[todayDate].convert || 0) + 1);
+              daily[todayDate].convert_sources[srcChannel] = (daily[todayDate].convert_sources[srcChannel] || 0) + 1;
+
+              const isSameDay = row.today_date === todayDate;
+              const newTodayClicks = isSameDay ? (row.today_clicks || 0) : 1;
+              const newTodayConvert = isSameDay ? Math.min(newTodayClicks, (row.today_convert || 0) + 1) : 1;
+
+              await env.DB.prepare(`
+                UPDATE links SET
+                  convert_clicks = MIN(clicks, convert_clicks + 1),
+                  today_convert = ?,
+                  today_date = ?,
+                  daily_json = ?
+                WHERE slug = ?
+              `).bind(newTodayConvert, todayDate, JSON.stringify(daily), slug).run();
+            }
+          } catch (colErr) {}
         }
         return Response.json({ success: true });
       } catch (e) {
@@ -129,7 +198,7 @@ export default {
           return Response.json({ error: "密码验证失败" }, { status: 403 });
         }
 
-        const todayDate = new Date().toISOString().slice(0, 10);
+        const todayDate = getBeijingDateStr();
         const search = (body.search || "").trim();
         const sort = body.sort || "latest";
         const page = Math.max(1, parseInt(body.page) || 1);
@@ -139,21 +208,32 @@ export default {
         // 1. 优先使用 D1 数据库
         if (env.DB) {
           try {
-            // 自适应热升级：自动补齐转存统计列与极速倒序索引（真正 100% 纯代码自动化，无需用户手动进数据库执行 SQL）
+            // 自适应热升级：自动补齐转存、今日爆款排序列与极速倒序索引（真正 100% 纯代码自动化，无需用户手动进数据库执行 SQL）
             try {
               await env.DB.prepare("ALTER TABLE links ADD COLUMN convert_clicks INTEGER DEFAULT 0").run();
             } catch (e) {}
             try {
+              await env.DB.prepare("ALTER TABLE links ADD COLUMN today_clicks INTEGER DEFAULT 0").run();
+              await env.DB.prepare("ALTER TABLE links ADD COLUMN today_uv INTEGER DEFAULT 0").run();
+              await env.DB.prepare("ALTER TABLE links ADD COLUMN today_convert INTEGER DEFAULT 0").run();
+              await env.DB.prepare("ALTER TABLE links ADD COLUMN today_date TEXT DEFAULT ''").run();
+              await env.DB.prepare("ALTER TABLE links ADD COLUMN source_wechat INTEGER DEFAULT 0").run();
+            } catch (e) {}
+            try {
               await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_links_created ON links(created_timestamp DESC)").run();
               await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_links_clicks ON links(clicks DESC)").run();
+              await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_links_today_clicks ON links(today_clicks DESC)").run();
             } catch (e) {}
 
-            // A. 全局大盘数据聚合（一条 SQL 瞬间搞定全局统计卡片）
+            // A. 全局大盘数据聚合（一条 SQL 瞬间搞定全局统计卡片，客观真实不受分页限制）
             let summary = {
               totalLinks: 0,
               totalClicks: 0,
               totalUv: 0,
               totalConvert: 0,
+              todayClicks: 0,
+              todayUv: 0,
+              todayConvert: 0,
               totalMobile: 0,
               totalPc: 0
             };
@@ -164,16 +244,22 @@ export default {
                   COALESCE(SUM(clicks), 0) as totalClicks,
                   COALESCE(SUM(uv), 0) as totalUv,
                   COALESCE(SUM(CASE WHEN convert_clicks > clicks THEN clicks ELSE convert_clicks END), 0) as totalConvert,
+                  COALESCE(SUM(CASE WHEN today_date = ? THEN today_clicks ELSE 0 END), 0) as todayClicks,
+                  COALESCE(SUM(CASE WHEN today_date = ? THEN today_uv ELSE 0 END), 0) as todayUv,
+                  COALESCE(SUM(CASE WHEN today_date = ? THEN today_convert ELSE 0 END), 0) as todayConvert,
                   COALESCE(SUM(mobile_clicks), 0) as totalMobile,
                   COALESCE(SUM(pc_clicks), 0) as totalPc
                 FROM links
-              `).first();
+              `).bind(todayDate, todayDate, todayDate).first();
               if (sumRow) {
                 summary = {
                   totalLinks: sumRow.totalLinks || 0,
                   totalClicks: sumRow.totalClicks || 0,
                   totalUv: sumRow.totalUv || 0,
                   totalConvert: sumRow.totalConvert || 0,
+                  todayClicks: sumRow.todayClicks || 0,
+                  todayUv: sumRow.todayUv || 0,
+                  todayConvert: Math.min(sumRow.todayClicks || 0, sumRow.todayConvert || 0),
                   totalMobile: sumRow.totalMobile || 0,
                   totalPc: sumRow.totalPc || 0
                 };
@@ -192,17 +278,19 @@ export default {
             const countRow = await env.DB.prepare(`SELECT COUNT(*) as filteredTotal FROM links ${whereClause}`).bind(...params).first();
             const filteredTotal = countRow ? countRow.filteredTotal : 0;
 
-            // D. 排序字段选择
+            // D. 排序字段选择（今日爆款必须基于当天日期与当天真实流量，绝不混淆历史总体！）
             let orderClause = "ORDER BY created_timestamp DESC";
+            let sortParams = [];
             if (sort === "total") {
               orderClause = "ORDER BY clicks DESC, created_timestamp DESC";
             } else if (sort === "today") {
-              orderClause = "ORDER BY clicks DESC, created_timestamp DESC";
+              orderClause = "ORDER BY (CASE WHEN today_date = ? THEN today_clicks ELSE 0 END) DESC, (CASE WHEN today_date = ? THEN today_uv ELSE 0 END) DESC, clicks DESC, created_timestamp DESC";
+              sortParams.push(todayDate, todayDate);
             }
 
             // E. 分页查询
             let querySql = `SELECT * FROM links ${whereClause} ${orderClause}`;
-            let queryParams = [...params];
+            let queryParams = [...params, ...sortParams];
 
             if (!isExport) {
               const offset = (page - 1) * pageSize;
@@ -218,7 +306,11 @@ export default {
               try {
                 daily = row.daily_json ? JSON.parse(row.daily_json) : {};
               } catch (e) {}
-              const todayStats = daily[todayDate] || { clicks: 0, uv: 0, mobile: 0, pc: 0 };
+              const todayStats = daily[todayDate] || { clicks: 0, uv: 0, mobile: 0, pc: 0, convert: 0 };
+              const isRowToday = row.today_date === todayDate;
+              const curTodayClicks = isRowToday ? (row.today_clicks || 0) : (todayStats.clicks || 0);
+              const curTodayUv = isRowToday ? (row.today_uv || 0) : (todayStats.uv || 0);
+              const curTodayConvert = isRowToday ? (row.today_convert || 0) : (todayStats.convert || 0);
 
               items.push({
                 slug: row.slug,
@@ -234,11 +326,24 @@ export default {
                 clicks: row.clicks || 0,
                 uv: row.uv || 0,
                 convertClicks: Math.min(row.clicks || 0, row.convert_clicks || 0),
-                todayClicks: todayStats.clicks || 0,
-                todayUv: todayStats.uv || 0,
+                todayClicks: curTodayClicks,
+                todayUv: curTodayUv,
+                todayConvert: Math.min(curTodayClicks, curTodayConvert),
                 sources: {
+                  wechat: row.source_wechat || 0,
                   twitter: row.source_twitter || 0,
                   direct: row.source_direct || 0,
+                  other: row.source_other || 0
+                },
+                devices: {
+                  mobile: row.mobile_clicks || 0,
+                  pc: row.pc_clicks || 0
+                },
+                daily: daily,
+                createdAt: row.created_at || "-",
+                createdTimestamp: row.created_timestamp || 0
+              });
+            }
                   other: row.source_other || 0
                 },
                 devices: {
@@ -499,7 +604,7 @@ export default {
 
         const backupUrl = (body.backupUrl || "").trim();
         const onlyMobile = !!body.onlyMobile;
-        const todayDate = new Date().toISOString().slice(0, 10);
+        const todayDate = getBeijingDateStr();
         const nowTs = Date.now();
         const record = {
           url: targetUrl,
@@ -650,7 +755,7 @@ export default {
 
               let daily = {};
               try { daily = d1Row.daily_json ? JSON.parse(d1Row.daily_json) : {}; } catch (e) {}
-              const todayDate = new Date().toISOString().slice(0, 10);
+              const todayDate = getBeijingDateStr();
               const todayStats = daily[todayDate] || { clicks: 0, uv: 0, mobile: 0, pc: 0 };
 
               return Response.json({
@@ -716,7 +821,7 @@ export default {
           item.title = newTitle;
         }
 
-        const todayDate = new Date().toISOString().slice(0, 10);
+        const todayDate = getBeijingDateStr();
         const daily = item.daily || {};
         const todayStats = daily[todayDate] || { clicks: 0, uv: 0, mobile: 0, pc: 0 };
         const createdTs = item.createdTimestamp || (item.createdAt && item.createdAt !== "-" ? new Date(item.createdAt.replace(/-/g, "/")).getTime() : 0);
@@ -822,7 +927,7 @@ export default {
         const item = JSON.parse(rawData);
         item.onlyMobile = body.onlyMobile !== undefined ? !!body.onlyMobile : !item.onlyMobile;
 
-        const todayDate = new Date().toISOString().slice(0, 10);
+        const todayDate = getBeijingDateStr();
         const daily = item.daily || {};
         const todayStats = daily[todayDate] || { clicks: 0, uv: 0, mobile: 0, pc: 0 };
         const createdTs = item.createdTimestamp || (item.createdAt && item.createdAt !== "-" ? new Date(item.createdAt.replace(/-/g, "/")).getTime() : 0);
@@ -959,42 +1064,44 @@ export default {
     const isQQ = /QQ\//i.test(userAgent);
     const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(userAgent);
 
+    const todayDate = getBeijingDateStr();
+    const detectedChannel = detectSourceChannel(request, url);
+
+    // 独立访客精准客观去重（Cookie 浏览器指纹 + KV 辅助去重，彻底消除纯 D1 模式下 UV 锁死为 1 的漏洞）
+    const cookieHeader = request.headers.get("cookie") || "";
+    const uvCookieName = `_p_uv_${path}_${todayDate}`;
+    let isNewUv = !cookieHeader.includes(`${uvCookieName}=1`);
+
     // 异步无阻塞统计（D1 数据库 10 万次极速原子计数，平滑兼容 KV）
     if (!isBot && ctx && ctx.waitUntil) {
       const updateTask = async () => {
         try {
           const clientIp = request.headers.get("cf-connecting-ip") || "127.0.0.1";
-          const todayDate = new Date().toISOString().slice(0, 10);
 
-          // 1. 独立访客 UV 去重
-          let isNewUv = false;
-          if (env.LINKS) {
+          if (env.LINKS && isNewUv) {
             const uvKey = "uv:" + path + ":" + clientIp + ":" + todayDate;
             const hasVisited = await env.LINKS.get(uvKey);
-            if (!hasVisited) {
-              isNewUv = true;
-              item.uv = (item.uv || 0) + 1;
+            if (hasVisited) {
+              isNewUv = false;
+            } else {
               await env.LINKS.put(uvKey, "1", { expirationTtl: 86400 });
-            }
-          } else {
-            if (!item.daily || !item.daily[todayDate] || !item.daily[todayDate].uv) {
-              isNewUv = true;
-              item.uv = (item.uv || 0) + 1;
             }
           }
 
           // 2. 统计增量更新
           item.clicks = (item.clicks || 0) + 1;
+          if (isNewUv) item.uv = (item.uv || 0) + 1;
 
-          // 来源追踪
-          const referer = (request.headers.get("referer") || "").toLowerCase();
-          if (!item.sources) item.sources = { twitter: 0, direct: 0, other: 0 };
-
-          let sTwitter = 0, sDirect = 0, sOther = 0;
-          if (referer.includes("t.co") || referer.includes("x.com") || referer.includes("twitter.com")) {
+          // 渠道统计拆解
+          if (!item.sources) item.sources = { wechat: 0, twitter: 0, direct: 0, other: 0 };
+          let sTwitter = 0, sDirect = 0, sOther = 0, sWechat = 0;
+          if (detectedChannel === "wechat") {
+            item.sources.wechat = (item.sources.wechat || 0) + 1;
+            sWechat = 1;
+          } else if (detectedChannel === "twitter") {
             item.sources.twitter = (item.sources.twitter || 0) + 1;
             sTwitter = 1;
-          } else if (!referer) {
+          } else if (detectedChannel === "direct") {
             item.sources.direct = (item.sources.direct || 0) + 1;
             sDirect = 1;
           } else {
@@ -1010,10 +1117,18 @@ export default {
             item.devices.pc = (item.devices.pc || 0) + 1;
           }
 
-          // 按日维度增量统计（保留近 30 天每日详情）
+          // 按日维度增量统计（包含当天点击、UV、手机/电脑、细分渠道及转化，保留 30 天）
           if (!item.daily) item.daily = {};
           if (!item.daily[todayDate]) {
-            item.daily[todayDate] = { clicks: 0, uv: 0, mobile: 0, pc: 0 };
+            item.daily[todayDate] = {
+              clicks: 0,
+              uv: 0,
+              convert: 0,
+              mobile: 0,
+              pc: 0,
+              sources: { wechat: 0, twitter: 0, direct: 0, other: 0 },
+              convert_sources: { wechat: 0, twitter: 0, direct: 0, other: 0 }
+            };
           }
           item.daily[todayDate].clicks = (item.daily[todayDate].clicks || 0) + 1;
           if (isMobile) {
@@ -1024,6 +1139,10 @@ export default {
           if (isNewUv) {
             item.daily[todayDate].uv = (item.daily[todayDate].uv || 0) + 1;
           }
+          if (!item.daily[todayDate].sources) {
+            item.daily[todayDate].sources = { wechat: 0, twitter: 0, direct: 0, other: 0 };
+          }
+          item.daily[todayDate].sources[detectedChannel] = (item.daily[todayDate].sources[detectedChannel] || 0) + 1;
 
           // 清理 30 天之前的陈旧日期记录，防止存储膨胀
           const dateKeys = Object.keys(item.daily).sort();
@@ -1075,7 +1194,7 @@ export default {
           }
 
           // 3. 执行数据持久化
-          // A. 优先写入 D1 数据库（每天 10 万次高并发原子递增，绝不丢数）
+          // A. 优先写入 D1 数据库（原子计数，支持当日字段跨天自愈更新）
           if (isFromD1 && env.DB) {
             await env.DB.prepare(`
               UPDATE links SET
@@ -1086,6 +1205,11 @@ export default {
                 source_twitter = source_twitter + ?,
                 source_direct = source_direct + ?,
                 source_other = source_other + ?,
+                source_wechat = source_wechat + ?,
+                today_clicks = CASE WHEN today_date = ? THEN today_clicks + 1 ELSE 1 END,
+                today_uv = CASE WHEN today_date = ? THEN today_uv + ? ELSE ? END,
+                today_convert = CASE WHEN today_date = ? THEN today_convert ELSE 0 END,
+                today_date = ?,
                 active_target = ?,
                 auto_switched = ?,
                 last_switched_at = ?,
@@ -1098,6 +1222,13 @@ export default {
               sTwitter,
               sDirect,
               sOther,
+              sWechat,
+              todayDate,
+              todayDate,
+              isNewUv ? 1 : 0,
+              isNewUv ? 1 : 0,
+              todayDate,
+              todayDate,
               item.activeTarget || "primary",
               item.autoSwitched ? 1 : 0,
               item.lastSwitchedAt || "",
@@ -1112,6 +1243,27 @@ export default {
               await env.LINKS.put(throttleKey, "1", { expirationTtl: 300 });
               const targetKey = "link:" + path;
               const todayStat = item.daily[todayDate] || { clicks: 0, uv: 0 };
+              await env.LINKS.put(targetKey, JSON.stringify(item), {
+                metadata: {
+                  url: item.url,
+                  backupUrl: item.backupUrl || "",
+                  activeTarget: item.activeTarget || "primary",
+                  autoSwitched: !!item.autoSwitched,
+                  title: item.title,
+                  clicks: item.clicks,
+                  uv: item.uv,
+                  today: todayDate,
+                  todayClicks: todayStat.clicks || 0,
+                  todayUv: todayStat.uv || 0,
+                  sources: item.sources,
+                  devices: item.devices,
+                  createdAt: item.createdAt || "-"
+                }
+              });
+            }
+          }
+        } catch (e) {}
+      };
               await env.LINKS.put(targetKey, JSON.stringify(item), {
                 metadata: {
                   url: item.url,
@@ -1817,6 +1969,8 @@ export default {
       }
     }
 
+    var currentTrafficSource = "${detectedChannel}";
+
     function reportAction(actionType) {
       try {
         var storageKey = "pan_conv_" + "${path}";
@@ -1835,7 +1989,7 @@ export default {
           sessionStorage.setItem(storageKey, "1");
         } catch (storageErr) {}
 
-        var payload = JSON.stringify({ slug: "${path}", action: actionType });
+        var payload = JSON.stringify({ slug: "${path}", action: actionType, source: currentTrafficSource });
         if (navigator.sendBeacon) {
           navigator.sendBeacon("/api/action", payload);
         } else {
@@ -1882,12 +2036,15 @@ export default {
 </body>
 </html>`;
 
-    return new Response(jumpHtml, {
-      headers: {
-        "content-type": "text/html;charset=UTF-8",
-        "cache-control": "public, max-age=15, stale-while-revalidate=30"
-      }
-    });
+    const respHeaders = {
+      "content-type": "text/html;charset=UTF-8",
+      "cache-control": "public, max-age=15, stale-while-revalidate=30"
+    };
+    if (isNewUv) {
+      respHeaders["Set-Cookie"] = `_p_uv_${path}_${todayDate}=1; Path=/; Max-Age=86400; SameSite=Lax`;
+    }
+
+    return new Response(jumpHtml, { headers: respHeaders });
   }
 };
 
@@ -2578,11 +2735,11 @@ function renderAdminPage() {
         <div id="statInsightText" style="flex:1;">-</div>
       </div>
 
-      <!-- 核心指标六宫格（今日 vs 累计，包含真实转存与转化率） -->
+      <!-- 核心指标六宫格（今日真实转化 vs 历史全周期，对称漏斗对比） -->
       <div class="stat-section">
         <div class="stat-section-title">
-          <span>📈 流量转化与漏斗大盘</span>
-          <span style="font-size:11px;color:var(--primary);font-weight:600;">实时更新</span>
+          <span>📈 实时流量转化漏斗大盘</span>
+          <span style="font-size:11px;color:var(--primary);font-weight:600;" id="statPvPerUvBadge">人均频次: 1.0</span>
         </div>
         <div class="stat-row-grid-6">
           <div class="stat-tile">
@@ -2593,9 +2750,9 @@ function renderAdminPage() {
             <div class="stat-tile-val" id="tileTodayUv" style="color:#10b981;">0</div>
             <div class="stat-tile-label">今日访客 (UV)</div>
           </div>
-          <div class="stat-tile" style="background:#f8fafc;">
-            <div class="stat-tile-val" id="tilePvPerUv" style="color:#6366f1;">1.0</div>
-            <div class="stat-tile-label">人均访问频次</div>
+          <div class="stat-tile" style="background:#eff6ff;border-color:#bfdbfe;">
+            <div class="stat-tile-val" id="tileTodayRate" style="color:#2563eb;">0%</div>
+            <div class="stat-tile-label" id="tileTodayConvCount" style="color:#1d4ed8;font-weight:600;">今日转存 0 次</div>
           </div>
           <div class="stat-tile">
             <div class="stat-tile-val" id="tileTotalPv">0</div>
@@ -2607,15 +2764,15 @@ function renderAdminPage() {
           </div>
           <div class="stat-tile" style="background:#f0fdf4;border-color:#bbf7d0;">
             <div class="stat-tile-val" id="tileConvertRate" style="color:#16a34a;">0%</div>
-            <div class="stat-tile-label" id="tileConvertCountSub" style="color:#15803d;font-weight:600;">转存 0 次</div>
+            <div class="stat-tile-label" id="tileConvertCountSub" style="color:#15803d;font-weight:600;">累计转存 0 次</div>
           </div>
         </div>
       </div>
 
-      <!-- 最近 7 天按日趋势双柱图 -->
+      <!-- 最近 7 天按日趋势双柱图与转化明细 -->
       <div class="stat-section">
         <div class="stat-section-title">
-          <span>📅 最近 7 天趋势 (PV / UV 双指标)</span>
+          <span>📅 最近 7 天趋势与每日转化</span>
           <div style="display:flex;align-items:center;gap:10px;font-size:11px;">
             <span style="display:inline-flex;align-items:center;gap:4px;">
               <span style="width:8px;height:8px;border-radius:2px;background:#4f46e5;display:inline-block;"></span> 点击 (PV)
@@ -2628,16 +2785,23 @@ function renderAdminPage() {
         <div class="bar-chart-container" id="barChartContainer">
           <!-- 双柱在此动态渲染 -->
         </div>
-        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-top:6px;padding:0 2px;">
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin:6px 0 10px 0;padding:0 2px;">
           <span>统计周期: 过去 7 天</span>
           <span id="statChartRange">-</span>
         </div>
+        <!-- 每日转化小清单 -->
+        <div id="statDailyListContainer" style="background:#f8fafc;border-radius:6px;border:1px solid #e2e8f0;padding:6px 10px;font-size:11px;color:#475569;display:none;">
+        </div>
       </div>
 
-      <!-- 终端设备 & 来源渠道双列画像（彩色进度条） -->
+      <!-- 终端设备 & 来源渠道双列画像（支持今日 vs 累计切换，包含渠道转存率） -->
       <div class="stat-section" style="margin-bottom:0;">
         <div class="stat-section-title">
-          <span>📱 终端设备 & 渠道分布</span>
+          <span>📱 终端设备 & 渠道精准转化</span>
+          <div style="display:inline-flex;background:#f1f5f9;border-radius:4px;padding:2px;gap:2px;">
+            <button type="button" id="btnChannelToday" class="sort-pill active" style="padding:2px 8px;font-size:11px;border-radius:3px;cursor:pointer;">🔥 今日渠道</button>
+            <button type="button" id="btnChannelTotal" class="sort-pill" style="padding:2px 8px;font-size:11px;border-radius:3px;cursor:pointer;">🌐 全周期</button>
+          </div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
           <!-- 终端设备 -->
@@ -2660,19 +2824,27 @@ function renderAdminPage() {
             </div>
           </div>
 
-          <!-- 渠道来源 -->
+          <!-- 渠道来源与转化漏斗 -->
           <div style="background:#fff;padding:12px;border-radius:8px;border:1px solid #e2e8f0;">
-            <div style="font-size:12px;font-weight:700;color:#334155;margin-bottom:6px;">引流来源分布</div>
+            <div style="font-size:12px;font-weight:700;color:#334155;margin-bottom:6px;display:flex;justify-content:space-between;">
+              <span id="statChannelTitle">引流与转存转化</span>
+              <span style="font-size:10px;color:var(--text-muted);">访问 · 转存(率)</span>
+            </div>
             <div class="channel-pill-list">
               <div class="channel-row">
-                <span style="color:#475569;white-space:nowrap;">💬 私域直接</span>
-                <div class="channel-bar-wrap"><div id="barSrcDirect" class="channel-bar-inner" style="width:0%;background:#10b981;"></div></div>
-                <strong id="statSrcDirect" style="font-size:11px;">0</strong>
+                <span style="color:#475569;white-space:nowrap;">💬 微信私域</span>
+                <div class="channel-bar-wrap"><div id="barSrcWechat" class="channel-bar-inner" style="width:0%;background:#059669;"></div></div>
+                <strong id="statSrcWechat" style="font-size:11px;">0</strong>
               </div>
               <div class="channel-row">
                 <span style="color:#475569;white-space:nowrap;">🐦 X / 推特</span>
                 <div class="channel-bar-wrap"><div id="barSrcTwitter" class="channel-bar-inner" style="width:0%;background:#38bdf8;"></div></div>
                 <strong id="statSrcTwitter" style="font-size:11px;">0</strong>
+              </div>
+              <div class="channel-row">
+                <span style="color:#475569;white-space:nowrap;">🔗 直接访问</span>
+                <div class="channel-bar-wrap"><div id="barSrcDirect" class="channel-bar-inner" style="width:0%;background:#10b981;"></div></div>
+                <strong id="statSrcDirect" style="font-size:11px;">0</strong>
               </div>
               <div class="channel-row">
                 <span style="color:#475569;white-space:nowrap;">🌐 外部其他</span>
@@ -2860,6 +3032,12 @@ function renderAdminPage() {
         } catch (e) {}
       }
 
+      function getClientBeijingDateStr(d) {
+        var dateObj = d || new Date();
+        var d8 = new Date(dateObj.getTime() + 8 * 3600 * 1000);
+        return d8.toISOString().slice(0, 10);
+      }
+
       function updateMetricsFromSummary(m) {
         document.getElementById("metricTotalLinks").innerText = m.totalLinks || 0;
 
@@ -2868,14 +3046,17 @@ function renderAdminPage() {
         var totalConvert = m.totalConvert || 0;
         var avgRate = totalClicks > 0 ? Math.min(100, Math.round((totalConvert / totalClicks) * 100)) : 0;
 
-        var curTodayClicks = allItems.reduce(function(acc, i) { return acc + (i.todayClicks || 0); }, 0);
-        var curTodayUv = allItems.reduce(function(acc, i) { return acc + (i.todayUv || 0); }, 0);
+        // 全站客观真实今日指标（直接取自 D1 服务端全局统计聚合，彻底消除分页仅能加当前页 20 条的失真漏洞）
+        var todayClicks = m.todayClicks !== undefined ? m.todayClicks : allItems.reduce(function(acc, i) { return acc + (i.todayClicks || 0); }, 0);
+        var todayUv = m.todayUv !== undefined ? m.todayUv : allItems.reduce(function(acc, i) { return acc + (i.todayUv || 0); }, 0);
+        var todayConv = m.todayConvert !== undefined ? m.todayConvert : 0;
+        var todayRate = todayClicks > 0 ? Math.min(100, Math.round((todayConv / todayClicks) * 100)) : 0;
 
-        document.getElementById("metricTodayClicks").innerText = curTodayClicks;
+        document.getElementById("metricTodayClicks").innerText = todayClicks;
         document.getElementById("metricTotalClicksSub").innerText = "全站累计 " + totalClicks + " 次 · 🎯转存 " + totalConvert + " (" + avgRate + "%)";
 
-        document.getElementById("metricTodayUv").innerText = curTodayUv;
-        document.getElementById("metricTotalUvSub").innerText = "全站累计: " + totalUv + " 人";
+        document.getElementById("metricTodayUv").innerText = todayUv;
+        document.getElementById("metricTotalUvSub").innerText = "全站累计访客: " + totalUv + " 人 · 今日转存 " + todayConv + " (" + todayRate + "%)";
 
         var totalMobile = m.totalMobile || 0;
         var totalPc = m.totalPc || 0;
@@ -2889,12 +3070,16 @@ function renderAdminPage() {
         document.getElementById("metricDeviceSub").innerText = "📱手机 " + totalMobile + " · 💻电脑 " + totalPc;
 
         if (allItems.length > 0) {
-          var sorted = allItems.slice().sort(function(a, b) { return (b.clicks || 0) - (a.clicks || 0); });
+          var sorted = allItems.slice().sort(function(a, b) { 
+            return currentSort === "today" ? ((b.todayClicks || 0) - (a.todayClicks || 0)) : ((b.clicks || 0) - (a.clicks || 0)); 
+          });
           var top = sorted[0];
-          if ((top.clicks || 0) > 0) {
+          var topVal = currentSort === "today" ? (top.todayClicks || 0) : (top.clicks || 0);
+          var topTag = currentSort === "today" ? "🔥 今日领跑 " : "🏆 历史领跑 ";
+          if (topVal > 0) {
             document.getElementById("metricTopTitle").innerText = top.title || top.slug;
             document.getElementById("metricTopTitle").setAttribute("title", top.title || top.slug);
-            document.getElementById("metricTopSub").innerText = "🔥 累计 " + top.clicks + " 次点击 (UV " + (top.uv || 0) + ")";
+            document.getElementById("metricTopSub").innerText = topTag + topVal + " 次点击 (UV " + (currentSort === "today" ? (top.todayUv || 0) : (top.uv || 0)) + ")";
           } else {
             document.getElementById("metricTopTitle").innerText = "暂无访问数据";
             document.getElementById("metricTopTitle").setAttribute("title", "暂无访问数据");
@@ -2916,12 +3101,14 @@ function renderAdminPage() {
 
         var totalConvert = allItems.reduce(function(acc, item) { return acc + (item.convertClicks || 0); }, 0);
         var avgRate = totalClicks > 0 ? Math.min(100, Math.round((totalConvert / totalClicks) * 100)) : 0;
+        var todayConvert = allItems.reduce(function(acc, item) { return acc + (item.todayConvert || 0); }, 0);
+        var todayRate = todayClicks > 0 ? Math.min(100, Math.round((todayConvert / todayClicks) * 100)) : 0;
 
         document.getElementById("metricTodayClicks").innerText = todayClicks;
         document.getElementById("metricTotalClicksSub").innerText = "累计 " + totalClicks + " 次 · 🎯转存 " + totalConvert + " (" + avgRate + "%)";
         
         document.getElementById("metricTodayUv").innerText = todayUv;
-        document.getElementById("metricTotalUvSub").innerText = "历史累计: " + totalUv + " 人";
+        document.getElementById("metricTotalUvSub").innerText = "历史累计: " + totalUv + " 人 · 今日转存 " + todayConvert + " (" + todayRate + "%)";
 
         var totalMobile = allItems.reduce(function(acc, item) { return acc + ((item.devices && item.devices.mobile) || 0); }, 0);
         var totalPc = allItems.reduce(function(acc, item) { return acc + ((item.devices && item.devices.pc) || 0); }, 0);
@@ -3206,13 +3393,20 @@ function renderAdminPage() {
         }
       }
 
-      // 打开深度数据画像与智能诊断弹窗（支持六宫格漏斗、智能运营洞察、彩色进度条与快捷操作）
+      var currentModalItem = null;
+      var currentChannelMode = "today";
+
+      // 打开深度数据画像与智能诊断弹窗（支持对称漏斗六宫格、渠道转化钻取、近7天逐日明细与快捷操作）
       async function openStatModal(slug) {
         var item = null;
         for (var i = 0; i < allItems.length; i++) {
           if (allItems[i].slug === slug) { item = allItems[i]; break; }
         }
         if (!item) return;
+
+        currentModalItem = item;
+        currentChannelMode = "today";
+        updateChannelTabsUI();
 
         // 1. 顶部基础信息与品牌标签
         var brand = item.brand || { name: "网盘资源", color: "#475569", bg: "#f1f5f9" };
@@ -3256,22 +3450,30 @@ function renderAdminPage() {
           statusBadge.style.borderColor = "#bfdbfe";
         }
 
-        // 3. 核心数值六宫格计算
+        // 3. 核心数值六宫格计算（今日实时 vs 历史全周期对称展现）
         var totalPv = item.clicks || 0;
         var totalUv = item.uv || 0;
         var todayPv = item.todayClicks || 0;
         var todayUv = item.todayUv || 0;
-        var conv = item.convertClicks || 0;
-        var rate = totalPv > 0 ? (Math.round((conv / totalPv) * 1000) / 10) : 0;
+        var totalConv = item.convertClicks || 0;
+        var todayConv = item.todayConvert || 0;
+
+        var totalRate = totalPv > 0 ? (Math.round((totalConv / totalPv) * 1000) / 10) : 0;
+        var todayRate = todayPv > 0 ? (Math.round((todayConv / todayPv) * 1000) / 10) : 0;
         var pvPerUv = totalUv > 0 ? (Math.round((totalPv / totalUv) * 10) / 10).toFixed(1) : "1.0";
+
+        var badgeEl = document.getElementById("statPvPerUvBadge");
+        if (badgeEl) badgeEl.innerText = "全周期人均频次: " + pvPerUv + " 次/人";
 
         document.getElementById("tileTodayPv").innerText = todayPv;
         document.getElementById("tileTodayUv").innerText = todayUv;
-        document.getElementById("tilePvPerUv").innerText = pvPerUv;
+        document.getElementById("tileTodayRate").innerText = todayRate + "%";
+        document.getElementById("tileTodayConvCount").innerText = "今日转存 " + todayConv + " 次";
+
         document.getElementById("tileTotalPv").innerText = totalPv;
         document.getElementById("tileTotalUv").innerText = totalUv;
-        document.getElementById("tileConvertRate").innerText = rate + "%";
-        document.getElementById("tileConvertCountSub").innerText = "真实转存 " + conv + " 次";
+        document.getElementById("tileConvertRate").innerText = totalRate + "%";
+        document.getElementById("tileConvertCountSub").innerText = "累计转存 " + totalConv + " 次";
 
         // 4. 智能运营洞察与诊断小贴士
         var insightEl = document.getElementById("statModalInsight");
@@ -3291,21 +3493,21 @@ function renderAdminPage() {
           insightEl.style.borderColor = "#fecdd3";
           insightEl.style.color = "#be123c";
           insightEl.style.display = "flex";
-        } else if (rate >= 40 && totalPv >= 1) {
+        } else if (todayRate >= 30 && todayPv >= 3) {
           iconEl.innerText = "🔥";
-          textEl.innerHTML = "<strong>【超级爆款潜质】</strong>真实转存转化率高达 <strong>" + rate + "%</strong>！用户极其认可该资源，极力推荐在更多社群重点置顶推广！";
+          textEl.innerHTML = "<strong>【今日极速爆发】</strong>今日转存转化率高达 <strong>" + todayRate + "%</strong>（已转存 " + todayConv + " 次）！建议在公众号推文、X(推特)或微信社群置顶主推！";
           insightEl.style.background = "#f0fdf4";
           insightEl.style.borderColor = "#bbf7d0";
           insightEl.style.color = "#15803d";
           insightEl.style.display = "flex";
-        } else if (rate >= 20 && totalPv >= 2) {
+        } else if (totalRate >= 30 && totalPv >= 5) {
           iconEl.innerText = "🎯";
-          textEl.innerHTML = "<strong>【转化表现优异】</strong>转存转化率为 <strong>" + rate + "%</strong>，流量承接良好，可继续在各社交渠道保持推广。";
+          textEl.innerHTML = "<strong>【高转化常青树】</strong>全周期转存率 <strong>" + totalRate + "%</strong>，流量承接表现极其稳健，可持续长期投放引流。";
           insightEl.style.background = "#eff6ff";
           insightEl.style.borderColor = "#bfdbfe";
           insightEl.style.color = "#1d4ed8";
           insightEl.style.display = "flex";
-        } else if (totalPv >= 10 && conv === 0) {
+        } else if (totalPv >= 10 && totalConv === 0) {
           iconEl.innerText = "⚠️";
           textEl.innerHTML = "<strong>【异常预警】</strong>累计访问已达 <strong>" + totalPv + "</strong> 次但暂无转存，建议点击下方「🚀 测试跳转」核验资源是否已失效或提取码变更！";
           insightEl.style.background = "#fffbeb";
@@ -3314,7 +3516,7 @@ function renderAdminPage() {
           insightEl.style.display = "flex";
         } else if (mobileRatio >= 0.8 && totalDev >= 2) {
           iconEl.innerText = "📱";
-          textEl.innerHTML = "<strong>【移动端主导】</strong>超 <strong>" + Math.round(mobileRatio * 100) + "%</strong> 流量来自手机，若需防爬虫，可在列表中开启「仅手机访问」模式。";
+          textEl.innerHTML = "<strong>【移动端主导】</strong>超 <strong>" + Math.round(mobileRatio * 100) + "%</strong> 流量来自手机端，若需防爬虫，可在列表中开启「仅手机访问」模式。";
           insightEl.style.background = "#faf5ff";
           insightEl.style.borderColor = "#e9d5ff";
           insightEl.style.color = "#7e22ce";
@@ -3329,7 +3531,7 @@ function renderAdminPage() {
         }
 
         // 5. 渲染设备横向进度条与渠道分布
-        renderDeviceAndSourcesBars(dev, item.sources || { twitter: 0, direct: 0, other: 0 });
+        renderDeviceAndSourcesBars(dev, item, currentChannelMode);
 
         // 6. 绑定底部快捷操作按钮
         var openLink = document.getElementById("statModalOpenLink");
@@ -3350,13 +3552,13 @@ function renderAdminPage() {
           };
         }
 
-        // 7. 渲染最近 7 天 PV / UV 双柱趋势图
+        // 7. 渲染最近 7 天 PV / UV 双柱趋势图及逐日明细清单
         renderDailyChart(item.daily || {});
 
         document.getElementById("statModal").style.display = "flex";
 
-        // 若尚未懒加载过深度按日数据，后台静默拉取并平滑更新图表
-        if (!item.daily) {
+        // 若尚未拉取过完整的 daily 数据，后台静默补拉
+        if (!item.daily || Object.keys(item.daily).length === 0) {
           try {
             var pwd = getPwd();
             var resp = await fetch("/api/detail", {
@@ -3370,13 +3572,27 @@ function renderAdminPage() {
               item.devices = data.devices || item.devices;
               item.sources = data.sources || item.sources;
               renderDailyChart(item.daily);
-              renderDeviceAndSourcesBars(item.devices, item.sources);
+              renderDeviceAndSourcesBars(item.devices, item, currentChannelMode);
             }
           } catch (e) {}
         }
       }
 
-      function renderDeviceAndSourcesBars(dev, src) {
+      function updateChannelTabsUI() {
+        var bToday = document.getElementById("btnChannelToday");
+        var bTotal = document.getElementById("btnChannelTotal");
+        if (bToday && bTotal) {
+          if (currentChannelMode === "today") {
+            bToday.classList.add("active");
+            bTotal.classList.remove("active");
+          } else {
+            bTotal.classList.add("active");
+            bToday.classList.remove("active");
+          }
+        }
+      }
+
+      function renderDeviceAndSourcesBars(dev, item, mode) {
         var mCount = (dev && dev.mobile) || 0;
         var pCount = (dev && dev.pc) || 0;
         var devSum = mCount + pCount;
@@ -3389,18 +3605,52 @@ function renderAdminPage() {
         document.getElementById("statBarPc").style.width = (devSum > 0 ? pPct : 0) + "%";
         document.getElementById("statDeviceRatioText").innerText = (devSum > 0 ? ("手机 " + mPct + "% / 电脑 " + pPct + "%") : "暂无访问");
 
-        var sTwitter = (src && src.twitter) || 0;
-        var sDirect = (src && src.direct) || 0;
-        var sOther = (src && src.other) || 0;
-        var srcSum = sTwitter + sDirect + sOther;
+        var todayDate = getClientBeijingDateStr();
+        var todayStats = (item && item.daily && item.daily[todayDate]) || {};
 
-        document.getElementById("statSrcTwitter").innerText = sTwitter;
-        document.getElementById("statSrcDirect").innerText = sDirect;
-        document.getElementById("statSrcOther").innerText = sOther;
+        var sWechat = 0, sTwitter = 0, sDirect = 0, sOther = 0;
+        var cWechat = 0, cTwitter = 0, cDirect = 0, cOther = 0;
 
+        if (mode === "today") {
+          document.getElementById("statChannelTitle").innerText = "🔥 今日引流与转存转化";
+          var srcToday = todayStats.sources || {};
+          var convToday = todayStats.convert_sources || {};
+          sWechat = srcToday.wechat || 0;
+          sTwitter = srcToday.twitter || 0;
+          sDirect = srcToday.direct || 0;
+          sOther = srcToday.other || 0;
+          cWechat = convToday.wechat || 0;
+          cTwitter = convToday.twitter || 0;
+          cDirect = convToday.direct || 0;
+          cOther = convToday.other || 0;
+        } else {
+          document.getElementById("statChannelTitle").innerText = "🌐 全周期引流与转存转化";
+          var srcTotal = (item && item.sources) || {};
+          sWechat = srcTotal.wechat || 0;
+          sTwitter = srcTotal.twitter || 0;
+          sDirect = srcTotal.direct || 0;
+          sOther = srcTotal.other || 0;
+        }
+
+        var srcSum = sWechat + sTwitter + sDirect + sOther;
         var maxSrc = Math.max(1, srcSum);
-        document.getElementById("barSrcDirect").style.width = Math.round((sDirect / maxSrc) * 100) + "%";
+
+        function formatChannelBadge(visit, conv) {
+          if (mode === "today") {
+            var r = visit > 0 ? (Math.round((conv / visit) * 100)) + "%" : "0%";
+            return visit + " 访 · 🎯" + conv + " (" + r + ")";
+          }
+          return visit + " 次点击";
+        }
+
+        document.getElementById("statSrcWechat").innerText = formatChannelBadge(sWechat, cWechat);
+        document.getElementById("statSrcTwitter").innerText = formatChannelBadge(sTwitter, cTwitter);
+        document.getElementById("statSrcDirect").innerText = formatChannelBadge(sDirect, cDirect);
+        document.getElementById("statSrcOther").innerText = formatChannelBadge(sOther, cOther);
+
+        document.getElementById("barSrcWechat").style.width = Math.round((sWechat / maxSrc) * 100) + "%";
         document.getElementById("barSrcTwitter").style.width = Math.round((sTwitter / maxSrc) * 100) + "%";
+        document.getElementById("barSrcDirect").style.width = Math.round((sDirect / maxSrc) * 100) + "%";
         document.getElementById("barSrcOther").style.width = Math.round((sOther / maxSrc) * 100) + "%";
       }
 
@@ -3408,14 +3658,15 @@ function renderAdminPage() {
         document.getElementById("statModal").style.display = "none";
       }
 
-      // 渲染最近 7 天原生双柱图（PV 与 UV 每日并列对比）
+      // 渲染最近 7 天原生双柱图及逐日明细列表（支持 PV、UV、转存数与每日转化率）
       function renderDailyChart(dailyMap) {
         var chartBox = document.getElementById("barChartContainer");
+        var listContainer = document.getElementById("statDailyListContainer");
         var days = [];
         for (var i = 6; i >= 0; i--) {
           var d = new Date();
           d.setDate(d.getDate() - i);
-          days.push(d.toISOString().slice(0, 10));
+          days.push(getClientBeijingDateStr(d));
         }
 
         document.getElementById("statChartRange").innerText = days[0].substring(5) + " 至 " + days[6].substring(5);
@@ -3430,18 +3681,21 @@ function renderAdminPage() {
         }
 
         var html = "";
+        var tableRows = [];
         for (var j = 0; j < days.length; j++) {
           var dateStr = days[j];
           var dayInfo = dailyMap[dateStr];
           var pvCount = dayInfo ? (dayInfo.clicks || 0) : 0;
           var uvCount = dayInfo ? (dayInfo.uv || 0) : 0;
+          var convCount = dayInfo ? (dayInfo.convert || 0) : 0;
+          var rate = pvCount > 0 ? (Math.round((convCount / pvCount) * 1000) / 10) + "%" : "0%";
 
           var pvHeight = Math.max(5, Math.round((pvCount / maxVal) * 80));
           var uvHeight = Math.max(5, Math.round((uvCount / maxVal) * 80));
           var isToday = (j === 6);
           var dateDisplay = dateStr.substring(5);
 
-          html += "<div class='chart-col' title='" + dateStr + "\\n点击 (PV): " + pvCount + "\\n访客 (UV): " + uvCount + "'>" +
+          html += "<div class='chart-col' title='" + dateStr + (isToday ? " (今天)" : "") + "\\n点击 (PV): " + pvCount + "\\n访客 (UV): " + uvCount + "\\n真实转存: " + convCount + " 次 (" + rate + ")'>" +
             "<div class='chart-dual-wrap'>" +
               "<div class='chart-pillar-pv' style='height:" + pvHeight + "%;'>" +
                 "<span class='chart-val-tip chart-val-pv'>" + (pvCount > 0 ? pvCount : "") + "</span>" +
@@ -3452,8 +3706,27 @@ function renderAdminPage() {
             "</div>" +
             "<span class='chart-date'" + (isToday ? " style='font-weight:700;color:#4f46e5;'" : "") + ">" + dateDisplay + "</span>" +
           "</div>";
+
+          if (pvCount > 0 || uvCount > 0) {
+            tableRows.push(
+              "<div style='display:flex;justify-content:space-between;align-items:center;padding:3px 0;border-bottom:1px dashed #e2e8f0;font-size:11px;'>" +
+                "<span" + (isToday ? " style='font-weight:700;color:#4f46e5;'" : "") + ">" + dateStr + (isToday ? " (今日)" : "") + "</span>" +
+                "<span>PV: <strong>" + pvCount + "</strong> · UV: <strong>" + uvCount + "</strong></span>" +
+                "<span style='color:#16a34a;font-weight:600;'>转存: " + convCount + " (" + rate + ")</span>" +
+              "</div>"
+            );
+          }
         }
         chartBox.innerHTML = html;
+
+        if (listContainer) {
+          if (tableRows.length > 0) {
+            listContainer.style.display = "block";
+            listContainer.innerHTML = "<div style='font-weight:700;margin-bottom:4px;color:#334155;'>📋 近 7 天每日转化清单：</div>" + tableRows.join("");
+          } else {
+            listContainer.style.display = "none";
+          }
+        }
       }
 
       function openEditModal(slug, url, title, backupUrl, activeTarget, autoSwitched, lastSwitchedAt, onlyMobile) {
@@ -3602,8 +3875,10 @@ function renderAdminPage() {
           var headers = [
             "短码(Slug)", "完整短链地址", "资源标题", "网盘品牌",
             "目标链接", "备用链接", "当前通道", "访问限制",
-            "今日点击(PV)", "今日访客(UV)", "累计点击(PV)", "累计访客(UV)",
-            "转存点击数", "转存转化率(CTR)", "手机访问量", "电脑访问量", "创建时间"
+            "今日点击(PV)", "今日访客(UV)", "今日转存数", "今日转存率(CTR)",
+            "累计点击(PV)", "累计访客(UV)", "累计转存数", "累计转存率(CTR)",
+            "微信引流", "Twitter引流", "直接访问", "其他来源",
+            "手机访问", "电脑访问", "创建时间"
           ];
 
           var csvRows = [];
@@ -3612,9 +3887,13 @@ function renderAdminPage() {
           for (var i = 0; i < items.length; i++) {
             var it = items[i];
             var dev = it.devices || {};
+            var src = it.sources || {};
             var totalPv = it.clicks || 0;
             var conv = it.convertClicks || 0;
             var ctr = totalPv > 0 ? (Math.round((conv / totalPv) * 1000) / 10) + "%" : "0%";
+            var todayPv = it.todayClicks || 0;
+            var todayConv = it.todayConvert || 0;
+            var todayCtr = todayPv > 0 ? (Math.round((todayConv / todayPv) * 1000) / 10) + "%" : "0%";
             var brandName = (it.brand && it.brand.name) ? it.brand.name : "网盘资源";
             var channel = it.activeTarget === "backup" ? "备用链接" : "主链接";
             if (it.autoSwitched) channel = "自动切备用";
@@ -3629,12 +3908,18 @@ function renderAdminPage() {
               escapeCsv(it.backupUrl || ""),
               escapeCsv(channel),
               escapeCsv(devLimit),
-              it.todayClicks || 0,
+              todayPv,
               it.todayUv || 0,
+              todayConv,
+              escapeCsv(todayCtr),
               totalPv,
               it.uv || 0,
               conv,
               escapeCsv(ctr),
+              src.wechat || 0,
+              src.twitter || 0,
+              src.direct || 0,
+              src.other || 0,
               dev.mobile || 0,
               dev.pc || 0,
               escapeCsv(it.createdAt || "")
@@ -3647,7 +3932,7 @@ function renderAdminPage() {
           var blobUrl = URL.createObjectURL(blob);
           var downloadLink = document.createElement("a");
           downloadLink.href = blobUrl;
-          downloadLink.download = "网盘短链与转化分析报表_" + new Date().toISOString().slice(0, 10) + ".csv";
+          downloadLink.download = "PanTools全量网盘转化与多维渠道分析报表_" + getClientBeijingDateStr() + ".csv";
           document.body.appendChild(downloadLink);
           downloadLink.click();
           document.body.removeChild(downloadLink);
@@ -3726,6 +4011,24 @@ function renderAdminPage() {
 
       document.getElementById("closeStatModalBtn").addEventListener("click", closeStatModal);
       document.getElementById("confirmStatModalBtn").addEventListener("click", closeStatModal);
+
+      // 弹窗内渠道来源切换监听（今日各渠道转化 vs 全周期渠道）
+      var btnChToday = document.getElementById("btnChannelToday");
+      if (btnChToday) {
+        btnChToday.addEventListener("click", function() {
+          currentChannelMode = "today";
+          updateChannelTabsUI();
+          if (currentModalItem) renderDeviceAndSourcesBars(currentModalItem.devices, currentModalItem, "today");
+        });
+      }
+      var btnChTotal = document.getElementById("btnChannelTotal");
+      if (btnChTotal) {
+        btnChTotal.addEventListener("click", function() {
+          currentChannelMode = "total";
+          updateChannelTabsUI();
+          if (currentModalItem) renderDeviceAndSourcesBars(currentModalItem.devices, currentModalItem, "total");
+        });
+      }
 
       // 分页控制按钮
       document.getElementById("prevPageBtn").addEventListener("click", goToPrevPage);

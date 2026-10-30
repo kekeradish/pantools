@@ -14,8 +14,13 @@ CREATE TABLE IF NOT EXISTS links (
   clicks INTEGER DEFAULT 0,
   uv INTEGER DEFAULT 0,
   convert_clicks INTEGER DEFAULT 0,
+  today_clicks INTEGER DEFAULT 0,
+  today_uv INTEGER DEFAULT 0,
+  today_convert INTEGER DEFAULT 0,
+  today_date TEXT DEFAULT '',
   mobile_clicks INTEGER DEFAULT 0,
   pc_clicks INTEGER DEFAULT 0,
+  source_wechat INTEGER DEFAULT 0,
   source_twitter INTEGER DEFAULT 0,
   source_direct INTEGER DEFAULT 0,
   source_other INTEGER DEFAULT 0,
@@ -24,6 +29,7 @@ CREATE TABLE IF NOT EXISTS links (
   daily_json TEXT DEFAULT '{}'
 );
 
--- 常用倒序极速查询索引（代码在初次运行时也会自适应检测并补齐）
+-- 常用极速查询索引（代码在初次运行时也会自适应静默检测并补齐）
 CREATE INDEX IF NOT EXISTS idx_links_created ON links(created_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_links_clicks ON links(clicks DESC);
+CREATE INDEX IF NOT EXISTS idx_links_today_clicks ON links(today_clicks DESC);
