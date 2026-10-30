@@ -225,6 +225,41 @@ export default {
               await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_links_today_clicks ON links(today_clicks DESC)").run();
             } catch (e) {}
 
+            // 自适应过渡期与历史数据平滑回填：将 daily_json 中的当天真实流量无感对齐到今日物理字段
+            try {
+              const rowsToSync = await env.DB.prepare(`
+                SELECT slug, daily_json, today_date, today_clicks, today_uv, today_convert 
+                FROM links 
+                WHERE (today_date != ? OR today_date IS NULL OR today_clicks = 0)
+                  AND daily_json LIKE ?
+              `).bind(todayDate, `%"${todayDate}"%`).all();
+
+              if (rowsToSync && rowsToSync.results && rowsToSync.results.length > 0) {
+                for (const r of rowsToSync.results) {
+                  try {
+                    const dJson = r.daily_json ? JSON.parse(r.daily_json) : {};
+                    const dStats = dJson[todayDate];
+                    if (dStats && (dStats.clicks > 0 || dStats.uv > 0)) {
+                      await env.DB.prepare(`
+                        UPDATE links SET
+                          today_clicks = ?,
+                          today_uv = ?,
+                          today_convert = ?,
+                          today_date = ?
+                        WHERE slug = ?
+                      `).bind(
+                        dStats.clicks || 0,
+                        dStats.uv || 0,
+                        Math.min(dStats.clicks || 0, dStats.convert || 0),
+                        todayDate,
+                        r.slug
+                      ).run();
+                    }
+                  } catch (e) {}
+                }
+              }
+            } catch (syncErr) {}
+
             // A. 全局大盘数据聚合（一条 SQL 瞬间搞定全局统计卡片，客观真实不受分页限制）
             let summary = {
               totalLinks: 0,
@@ -308,9 +343,9 @@ export default {
               } catch (e) {}
               const todayStats = daily[todayDate] || { clicks: 0, uv: 0, mobile: 0, pc: 0, convert: 0 };
               const isRowToday = row.today_date === todayDate;
-              const curTodayClicks = isRowToday ? (row.today_clicks || 0) : (todayStats.clicks || 0);
-              const curTodayUv = isRowToday ? (row.today_uv || 0) : (todayStats.uv || 0);
-              const curTodayConvert = isRowToday ? (row.today_convert || 0) : (todayStats.convert || 0);
+              const curTodayClicks = Math.max(isRowToday ? (row.today_clicks || 0) : 0, todayStats.clicks || 0);
+              const curTodayUv = Math.max(isRowToday ? (row.today_uv || 0) : 0, todayStats.uv || 0);
+              const curTodayConvert = Math.max(isRowToday ? (row.today_convert || 0) : 0, todayStats.convert || 0);
 
               items.push({
                 slug: row.slug,
@@ -3014,10 +3049,16 @@ function renderAdminPage() {
         var totalConvert = m.totalConvert || 0;
         var avgRate = totalClicks > 0 ? Math.min(100, Math.round((totalConvert / totalClicks) * 100)) : 0;
 
-        // 全站客观真实今日指标（直接取自 D1 服务端全局统计聚合，彻底消除分页仅能加当前页 20 条的失真漏洞）
-        var todayClicks = m.todayClicks !== undefined ? m.todayClicks : allItems.reduce(function(acc, i) { return acc + (i.todayClicks || 0); }, 0);
-        var todayUv = m.todayUv !== undefined ? m.todayUv : allItems.reduce(function(acc, i) { return acc + (i.todayUv || 0); }, 0);
-        var todayConv = m.todayConvert !== undefined ? m.todayConvert : 0;
+        // 全站客观真实今日指标（服务端全局统计聚合 + 当前列表自适应双轨对齐，彻底杜绝数据为 0）
+        var listTodayClicks = allItems.reduce(function(acc, i) { return acc + (i.todayClicks || 0); }, 0);
+        var todayClicks = Math.max(m.todayClicks || 0, listTodayClicks);
+
+        var listTodayUv = allItems.reduce(function(acc, i) { return acc + (i.todayUv || 0); }, 0);
+        var todayUv = Math.max(m.todayUv || 0, listTodayUv);
+
+        var listTodayConv = allItems.reduce(function(acc, i) { return acc + (i.todayConvert || 0); }, 0);
+        var todayConv = Math.max(m.todayConvert || 0, listTodayConv);
+
         var todayRate = todayClicks > 0 ? Math.min(100, Math.round((todayConv / todayClicks) * 100)) : 0;
 
         document.getElementById("metricTodayClicks").innerText = todayClicks;
