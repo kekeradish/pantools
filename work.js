@@ -1253,27 +1253,6 @@ export default {
           }
         } catch (e) {}
       };
-              await env.LINKS.put(targetKey, JSON.stringify(item), {
-                metadata: {
-                  url: item.url,
-                  backupUrl: item.backupUrl || "",
-                  activeTarget: item.activeTarget || "primary",
-                  autoSwitched: !!item.autoSwitched,
-                  title: item.title,
-                  clicks: item.clicks,
-                  uv: item.uv,
-                  today: todayDate,
-                  todayClicks: todayStat.clicks || 0,
-                  todayUv: todayStat.uv || 0,
-                  sources: item.sources,
-                  devices: item.devices,
-                  createdAt: item.createdAt || "-"
-                }
-              });
-            }
-          }
-        } catch (e) {}
-      };
       ctx.waitUntil(updateTask());
     }
 
