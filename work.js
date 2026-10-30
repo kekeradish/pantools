@@ -344,17 +344,6 @@ export default {
                 createdTimestamp: row.created_timestamp || 0
               });
             }
-                  other: row.source_other || 0
-                },
-                devices: {
-                  mobile: row.mobile_clicks || 0,
-                  pc: row.pc_clicks || 0
-                },
-                daily: daily,
-                createdAt: row.created_at || "-",
-                createdTimestamp: row.created_timestamp || 0
-              });
-            }
 
             return new Response(JSON.stringify({
               success: true,
