@@ -655,11 +655,13 @@ export default {
               INSERT OR REPLACE INTO links (
                 slug, url, backup_url, active_target, auto_switched, only_mobile, title,
                 clicks, uv, mobile_clicks, pc_clicks, source_twitter, source_direct, source_other,
+                today_clicks, today_uv, today_convert, today_date,
                 created_at, created_timestamp, daily_json
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).bind(
               slug, targetUrl, backupUrl, "primary", 0, onlyMobile ? 1 : 0, finalTitle,
               0, 0, 0, 0, 0, 0, 0,
+              0, 0, 0, todayDate,
               record.createdAt, nowTs,
               JSON.stringify(record.daily)
             ).run();
@@ -1082,8 +1084,36 @@ export default {
       });
     }
 
+    // 1. HTTP 请求方法严格限定：仅允许 GET 与 HEAD，HEAD 请求直接返回 200 响应头（安全模块嗅探专用，绝不触发点击统计）
+    if (request.method === "HEAD") {
+      return new Response(null, {
+        status: 200,
+        headers: { "content-type": "text/html;charset=UTF-8" }
+      });
+    }
+    if (request.method !== "GET") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+
     const userAgent = request.headers.get("user-agent") || "";
-    const isBot = /Twitterbot|facebookexternalhit|TelegramBot|bot|spider|crawl|slurp|curl|wget|python|java|bytespider|yisouspider|sogou|httpclient|postman|go-http-client/i.test(userAgent);
+    // 2. 爬虫、自动化探针与无 UA 请求过滤（覆盖无 UA、HeadlessChrome、安全扫描器等）
+    const isBot = !userAgent || userAgent.length < 5 || /Twitterbot|facebookexternalhit|TelegramBot|bot|spider|crawl|slurp|curl|wget|python|java|bytespider|yisouspider|sogou|httpclient|postman|go-http-client|HeadlessChrome|Lighthouse|PTST|PhantomJS|Selenium|Puppeteer|SafeBrowsing|Scanner|Netcraft|Nmap/i.test(userAgent);
+
+    // 3. 浏览器静默投机预加载检测（Chrome/Edge Speculative Rules / Prefetch / Prerender 等后台静默预读取）
+    const purpose = (request.headers.get("purpose") || "").toLowerCase();
+    const secPurpose = (request.headers.get("sec-purpose") || "").toLowerCase();
+    const xPurpose = (request.headers.get("x-purpose") || "").toLowerCase();
+    const xMoz = (request.headers.get("x-moz") || "").toLowerCase();
+    const isPrefetch = purpose === "prefetch" || 
+                       secPurpose.includes("prefetch") || 
+                       secPurpose.includes("prerender") || 
+                       xPurpose === "preview" || 
+                       xMoz === "prefetch";
+
+    // 4. 管理后台来源自回环探测过滤（Referer 包含后台路径或携带预览测试参数时，放行展示但绝不计入真实引流统计）
+    const referer = (request.headers.get("referer") || "").toLowerCase();
+    const isAdminOrigin = referer.includes(ADMIN_PATH.toLowerCase()) || url.searchParams.has("preview") || url.searchParams.has("admin_test");
+
     const isWechat = /MicroMessenger/i.test(userAgent);
     const isQQ = /QQ\//i.test(userAgent);
     const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(userAgent);
@@ -1096,8 +1126,11 @@ export default {
     const uvCookieName = `_p_uv_${path}_${todayDate}`;
     let isNewUv = !cookieHeader.includes(`${uvCookieName}=1`);
 
+    // 仅在真实外部访客打开且非预加载、非后台自触发时才计入统计（彻底消除后台刚生成短链刷新就出现 1 次访问的虚假数据）
+    const shouldCount = !isBot && !isPrefetch && !isAdminOrigin;
+
     // 异步无阻塞统计（D1 数据库 10 万次极速原子计数，平滑兼容 KV）
-    if (!isBot && ctx && ctx.waitUntil) {
+    if (shouldCount && ctx && ctx.waitUntil) {
       const updateTask = async () => {
         try {
           const clientIp = request.headers.get("cf-connecting-ip") || "127.0.0.1";
@@ -2043,7 +2076,7 @@ export default {
       "content-type": "text/html;charset=UTF-8",
       "cache-control": "public, max-age=15, stale-while-revalidate=30"
     };
-    if (isNewUv) {
+    if (shouldCount && isNewUv) {
       respHeaders["Set-Cookie"] = `_p_uv_${path}_${todayDate}=1; Path=/; Max-Age=86400; SameSite=Lax`;
     }
 
@@ -2663,7 +2696,7 @@ function renderAdminPage() {
         <div class="result-link" id="resUrl"></div>
         <div style="display:flex;gap:8px;margin-top:10px;">
           <button type="button" class="btn act-copy" id="copyGenBtn" style="padding:7px 16px;font-size:13px;">📋 复制短链</button>
-          <a id="resTestBtn" href="#" target="_blank" class="btn btn-secondary" style="font-size:13px;padding:7px 14px;">↗ 立即测试访问</a>
+          <a id="resTestBtn" href="#" target="_blank" rel="nofollow no-prefetch noreferrer noopener" class="btn btn-secondary" style="font-size:13px;padding:7px 14px;">↗ 立即测试访问</a>
         </div>
       </div>
     </div>
@@ -2862,7 +2895,7 @@ function renderAdminPage() {
       <!-- 底部快捷操作栏 -->
       <div class="modal-footer-dual">
         <div style="display:flex;gap:6px;flex-wrap:wrap;">
-          <a id="statModalOpenLink" href="#" target="_blank" class="btn btn-secondary" style="padding:6px 12px;font-size:12px;text-decoration:none;">🚀 测试跳转</a>
+          <a id="statModalOpenLink" href="#" target="_blank" rel="nofollow no-prefetch noreferrer noopener" class="btn btn-secondary" style="padding:6px 12px;font-size:12px;text-decoration:none;">🚀 测试跳转</a>
           <button type="button" class="btn btn-secondary" id="statModalCopyBtn" style="padding:6px 12px;font-size:12px;">📋 复制短链</button>
           <button type="button" class="btn btn-secondary" id="statModalEditBtn" style="padding:6px 12px;font-size:12px;">✏️ 编辑配置</button>
         </div>
@@ -3231,7 +3264,7 @@ function renderAdminPage() {
               "<div style='font-size:11px;color:var(--text-muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + item.url + "'>目标: " + item.url + "</div>" +
             "</td>" +
             "<td>" +
-              "<div><a href='" + item.shortUrl + "' target='_blank' style='color:var(--primary);text-decoration:none;font-weight:700;font-size:12px;display:inline-block;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + item.shortUrl + "'>" + item.shortUrl + "</a></div>" +
+              "<div><a href='" + item.shortUrl + "?preview=1' target='_blank' rel='nofollow no-prefetch noreferrer noopener' style='color:var(--primary);text-decoration:none;font-weight:700;font-size:12px;display:inline-block;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + item.shortUrl + "'>" + item.shortUrl + "</a></div>" +
               "<div style='margin-top:4px;'>" +
                 "<div class='device-segmented-group'>" +
                   "<button type='button' class='btn-segment" + (!item.onlyMobile ? " active" : "") + "' data-slug='" + item.slug + "' data-target-mobile='0' title='允许所有设备（电脑和手机）直接访问网盘'>" +
@@ -3385,7 +3418,7 @@ function renderAdminPage() {
           } else {
             document.getElementById("resBox").style.display = "block";
             document.getElementById("resUrl").innerText = data.shortUrl;
-            document.getElementById("resTestBtn").setAttribute("href", data.shortUrl);
+            document.getElementById("resTestBtn").setAttribute("href", data.shortUrl + "?preview=1");
             urlInput.value = "";
             titleInput.value = "";
             slugInput.value = "";
@@ -3544,7 +3577,7 @@ function renderAdminPage() {
 
         // 6. 绑定底部快捷操作按钮
         var openLink = document.getElementById("statModalOpenLink");
-        if (openLink) openLink.href = item.shortUrl || ("/" + item.slug);
+        if (openLink) openLink.href = (item.shortUrl || ("/" + item.slug)) + "?preview=1";
 
         var copyBtn = document.getElementById("statModalCopyBtn");
         if (copyBtn) {
