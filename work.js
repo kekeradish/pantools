@@ -20,6 +20,17 @@ export default {
       return beijingTime.toISOString().slice(0, 10);
     }
 
+    // 生成管理员专属设备凭据哈希（用于识别管理员本人设备访问，实现免计不污染引流大盘）
+    async function getAdminTokenHash(pwd) {
+      try {
+        const enc = new TextEncoder().encode("pantools_adm_sec_" + (pwd || "123456"));
+        const buf = await crypto.subtle.digest("SHA-256", enc);
+        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+      } catch (e) {
+        return "pan_adm_fallback_token";
+      }
+    }
+
     // 科学客观的渠道归因探测引擎（URL 推广参数 > 客户端 User-Agent 特征 > Referer 来源）
     function detectSourceChannel(req, requestUrl) {
       try {
@@ -74,12 +85,18 @@ export default {
 
         const body = await request.json();
 
-        // 2. 密码验证通过：清除此 IP 历史输错记录
+        // 2. 密码验证通过：清除此 IP 历史输错记录，并为管理员设备下发豁免凭据 Cookie
         if (body && body.pwd === ADMIN_PASSWORD) {
-          if (failRecord) {
+          if (failRecord && env.LINKS) {
             await env.LINKS.delete(lockKey);
           }
-          return Response.json({ success: true });
+          const adminAuthHash = await getAdminTokenHash(ADMIN_PASSWORD);
+          return new Response(JSON.stringify({ success: true }), {
+            headers: {
+              "Content-Type": "application/json;charset=UTF-8",
+              "Set-Cookie": `_p_adm_auth=${adminAuthHash}; Path=/; Max-Age=2592000; SameSite=Lax`
+            }
+          });
         }
 
         // 3. 密码验证失败：递增计数，达到 5 次锁定 15 分钟
@@ -380,6 +397,7 @@ export default {
               });
             }
 
+            const admCookieVal = await getAdminTokenHash(ADMIN_PASSWORD);
             return new Response(JSON.stringify({
               success: true,
               items: items,
@@ -393,7 +411,8 @@ export default {
               headers: {
                 "Content-Type": "application/json;charset=UTF-8",
                 "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                "Pragma": "no-cache"
+                "Pragma": "no-cache",
+                "Set-Cookie": `_p_adm_auth=${admCookieVal}; Path=/; Max-Age=2592000; SameSite=Lax`
               }
             });
           } catch (d1Err) {}
@@ -491,6 +510,7 @@ export default {
         const offset = (page - 1) * pageSize;
         const pageItems = isExport ? allItems : allItems.slice(offset, offset + pageSize);
 
+        const admCookieVal = await getAdminTokenHash(ADMIN_PASSWORD);
         return new Response(JSON.stringify({
           success: true,
           items: pageItems,
@@ -503,7 +523,8 @@ export default {
           headers: {
             "Content-Type": "application/json;charset=UTF-8",
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache"
+            "Pragma": "no-cache",
+            "Set-Cookie": `_p_adm_auth=${admCookieVal}; Path=/; Max-Age=2592000; SameSite=Lax`
           }
         });
       } catch (err) {
@@ -1110,9 +1131,35 @@ export default {
                        xPurpose === "preview" || 
                        xMoz === "prefetch";
 
-    // 4. 管理后台来源自回环探测过滤（Referer 包含后台路径或携带预览测试参数时，放行展示但绝不计入真实引流统计）
+    // 4. 管理后台来源自回环探测过滤（Referer 包含后台路径或携带预览测试参数）
     const referer = (request.headers.get("referer") || "").toLowerCase();
     const isAdminOrigin = referer.includes(ADMIN_PATH.toLowerCase()) || url.searchParams.has("preview") || url.searchParams.has("admin_test");
+
+    // 5. 管理员专属设备 Cookie 认证过滤（管理员无论通过何种方式打开短链均豁免，保证大盘绝对纯净客观）
+    const cookieHeader = request.headers.get("cookie") || "";
+    const adminTokenExpected = await getAdminTokenHash(ADMIN_PASSWORD);
+    const isAdminDevice = cookieHeader.includes(`_p_adm_auth=${adminTokenExpected}`);
+
+    // 6. 后台扩展/脚本静默嗅探探测过滤（非顶层 document 导航的后台子资源抓取）
+    const secFetchDest = (request.headers.get("sec-fetch-dest") || "").toLowerCase();
+    const secFetchMode = (request.headers.get("sec-fetch-mode") || "").toLowerCase();
+    const isSubresourceFetch = (secFetchDest && secFetchDest !== "document") || (secFetchMode && secFetchMode !== "navigate" && secFetchMode !== "same-origin");
+
+    // 判定拦截原因与真实性准入
+    let blockReason = "";
+    if (isAdminDevice) {
+      blockReason = "管理员设备 (免计)";
+    } else if (isAdminOrigin) {
+      blockReason = "管理后台来源";
+    } else if (isBot) {
+      blockReason = "爬虫/探针 UA";
+    } else if (isPrefetch) {
+      blockReason = "浏览器静默预读";
+    } else if (isSubresourceFetch) {
+      blockReason = "扩展/脚本后台嗅探";
+    }
+
+    const shouldCount = !blockReason;
 
     const isWechat = /MicroMessenger/i.test(userAgent);
     const isQQ = /QQ\//i.test(userAgent);
@@ -1122,201 +1169,224 @@ export default {
     const detectedChannel = detectSourceChannel(request, url);
 
     // 独立访客精准客观去重（Cookie 浏览器指纹 + KV 辅助去重，彻底消除纯 D1 模式下 UV 锁死为 1 的漏洞）
-    const cookieHeader = request.headers.get("cookie") || "";
     const uvCookieName = `_p_uv_${path}_${todayDate}`;
     let isNewUv = !cookieHeader.includes(`${uvCookieName}=1`);
 
-    // 仅在真实外部访客打开且非预加载、非后台自触发时才计入统计（彻底消除后台刚生成短链刷新就出现 1 次访问的虚假数据）
-    const shouldCount = !isBot && !isPrefetch && !isAdminOrigin;
-
-    // 异步无阻塞统计（D1 数据库 10 万次极速原子计数，平滑兼容 KV）
-    if (shouldCount && ctx && ctx.waitUntil) {
+    // 异步安全记录与更新（无论是真实访客还是被拦截探针，均写入最近审计日志溯源）
+    if (ctx && ctx.waitUntil) {
       const updateTask = async () => {
         try {
           const clientIp = request.headers.get("cf-connecting-ip") || "127.0.0.1";
+          const clientCountry = request.headers.get("cf-ipcountry") || "CN";
+          const nowBeijingTimeStr = new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace("T", " ").slice(0, 19);
 
-          if (env.LINKS && isNewUv) {
-            const uvKey = "uv:" + path + ":" + clientIp + ":" + todayDate;
-            const hasVisited = await env.LINKS.get(uvKey);
-            if (hasVisited) {
-              isNewUv = false;
-            } else {
-              await env.LINKS.put(uvKey, "1", { expirationTtl: 86400 });
-            }
-          }
+          // 记录访问溯源审计日志（保留最近 10 次真实/拦截记录）
+          const logEntry = {
+            time: nowBeijingTimeStr,
+            ip: clientIp,
+            country: clientCountry,
+            device: isMobile ? "手机端" : "电脑端",
+            source: detectedChannel,
+            ua: userAgent.slice(0, 120),
+            counted: shouldCount ? 1 : 0,
+            reason: blockReason || "真实有效访问"
+          };
 
-          // 2. 统计增量更新
-          item.clicks = (item.clicks || 0) + 1;
-          if (isNewUv) item.uv = (item.uv || 0) + 1;
-
-          // 渠道统计拆解
-          if (!item.sources) item.sources = { wechat: 0, twitter: 0, direct: 0, other: 0 };
-          let sTwitter = 0, sDirect = 0, sOther = 0, sWechat = 0;
-          if (detectedChannel === "wechat") {
-            item.sources.wechat = (item.sources.wechat || 0) + 1;
-            sWechat = 1;
-          } else if (detectedChannel === "twitter") {
-            item.sources.twitter = (item.sources.twitter || 0) + 1;
-            sTwitter = 1;
-          } else if (detectedChannel === "direct") {
-            item.sources.direct = (item.sources.direct || 0) + 1;
-            sDirect = 1;
-          } else {
-            item.sources.other = (item.sources.other || 0) + 1;
-            sOther = 1;
-          }
-
-          // 手机 vs 电脑 设备统计
-          if (!item.devices) item.devices = { mobile: 0, pc: 0 };
-          if (isMobile) {
-            item.devices.mobile = (item.devices.mobile || 0) + 1;
-          } else {
-            item.devices.pc = (item.devices.pc || 0) + 1;
-          }
-
-          // 按日维度增量统计（包含当天点击、UV、手机/电脑、细分渠道及转化，保留 30 天）
           if (!item.daily) item.daily = {};
-          if (!item.daily[todayDate]) {
-            item.daily[todayDate] = {
-              clicks: 0,
-              uv: 0,
-              convert: 0,
-              mobile: 0,
-              pc: 0,
-              sources: { wechat: 0, twitter: 0, direct: 0, other: 0 },
-              convert_sources: { wechat: 0, twitter: 0, direct: 0, other: 0 }
-            };
-          }
-          item.daily[todayDate].clicks = (item.daily[todayDate].clicks || 0) + 1;
-          if (isMobile) {
-            item.daily[todayDate].mobile = (item.daily[todayDate].mobile || 0) + 1;
-          } else {
-            item.daily[todayDate].pc = (item.daily[todayDate].pc || 0) + 1;
-          }
-          if (isNewUv) {
-            item.daily[todayDate].uv = (item.daily[todayDate].uv || 0) + 1;
-          }
-          if (!item.daily[todayDate].sources) {
-            item.daily[todayDate].sources = { wechat: 0, twitter: 0, direct: 0, other: 0 };
-          }
-          item.daily[todayDate].sources[detectedChannel] = (item.daily[todayDate].sources[detectedChannel] || 0) + 1;
+          if (!item.daily.logs) item.daily.logs = [];
+          item.daily.logs.unshift(logEntry);
+          if (item.daily.logs.length > 10) item.daily.logs.pop();
 
-          // 清理 30 天之前的陈旧日期记录，防止存储膨胀
-          const dateKeys = Object.keys(item.daily).sort();
-          if (dateKeys.length > 30) {
-            for (let i = 0; i < dateKeys.length - 30; i++) {
-              delete item.daily[dateKeys[i]];
-            }
-          }
-
-          // 智能探活与自动救火：如果配置了备用链接，且当前仍在用主链接，进行轻量探活
-          if (item.backupUrl && item.activeTarget !== "backup") {
-            let inCooldown = false;
-            if (env.LINKS) {
-              const checkCooldownKey = "chk:" + path;
-              inCooldown = await env.LINKS.get(checkCooldownKey);
-              if (!inCooldown) {
-                await env.LINKS.put(checkCooldownKey, "1", { expirationTtl: 900 });
+          // 仅在真实外部访客时递增统计指标
+          if (shouldCount) {
+            if (env.LINKS && isNewUv) {
+              const uvKey = "uv:" + path + ":" + clientIp + ":" + todayDate;
+              const hasVisited = await env.LINKS.get(uvKey);
+              if (hasVisited) {
+                isNewUv = false;
+              } else {
+                await env.LINKS.put(uvKey, "1", { expirationTtl: 86400 });
               }
             }
-            if (!inCooldown) {
-              try {
-                const checkResp = await fetch(item.url, {
-                  method: "GET",
-                  headers: {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-                  }
-                });
-                let isDead = false;
-                if (checkResp.status === 404) {
-                  isDead = true;
-                } else if (checkResp.ok) {
-                  const checkHtml = await checkResp.text();
-                  const invalidKeywords = ["分享已失效", "文件不存在", "已被取消", "包含违规内容", "分享已删除", "链接已失效"];
-                  for (let w of invalidKeywords) {
-                    if (checkHtml.includes(w)) {
-                      isDead = true;
-                      break;
+
+            // 统计增量更新
+            item.clicks = (item.clicks || 0) + 1;
+            if (isNewUv) item.uv = (item.uv || 0) + 1;
+
+            // 渠道统计拆解
+            if (!item.sources) item.sources = { wechat: 0, twitter: 0, direct: 0, other: 0 };
+            let sTwitter = 0, sDirect = 0, sOther = 0, sWechat = 0;
+            if (detectedChannel === "wechat") {
+              item.sources.wechat = (item.sources.wechat || 0) + 1;
+              sWechat = 1;
+            } else if (detectedChannel === "twitter") {
+              item.sources.twitter = (item.sources.twitter || 0) + 1;
+              sTwitter = 1;
+            } else if (detectedChannel === "direct") {
+              item.sources.direct = (item.sources.direct || 0) + 1;
+              sDirect = 1;
+            } else {
+              item.sources.other = (item.sources.other || 0) + 1;
+              sOther = 1;
+            }
+
+            // 手机 vs 电脑 设备统计
+            if (!item.devices) item.devices = { mobile: 0, pc: 0 };
+            if (isMobile) {
+              item.devices.mobile = (item.devices.mobile || 0) + 1;
+            } else {
+              item.devices.pc = (item.devices.pc || 0) + 1;
+            }
+
+            // 按日维度增量统计
+            if (!item.daily[todayDate]) {
+              item.daily[todayDate] = {
+                clicks: 0,
+                uv: 0,
+                convert: 0,
+                mobile: 0,
+                pc: 0,
+                sources: { wechat: 0, twitter: 0, direct: 0, other: 0 },
+                convert_sources: { wechat: 0, twitter: 0, direct: 0, other: 0 }
+              };
+            }
+            item.daily[todayDate].clicks = (item.daily[todayDate].clicks || 0) + 1;
+            if (isMobile) {
+              item.daily[todayDate].mobile = (item.daily[todayDate].mobile || 0) + 1;
+            } else {
+              item.daily[todayDate].pc = (item.daily[todayDate].pc || 0) + 1;
+            }
+            if (isNewUv) {
+              item.daily[todayDate].uv = (item.daily[todayDate].uv || 0) + 1;
+            }
+            if (!item.daily[todayDate].sources) {
+              item.daily[todayDate].sources = { wechat: 0, twitter: 0, direct: 0, other: 0 };
+            }
+            item.daily[todayDate].sources[detectedChannel] = (item.daily[todayDate].sources[detectedChannel] || 0) + 1;
+
+            // 清理 30 天之前的陈旧日期记录
+            const dateKeys = Object.keys(item.daily).filter(k => k !== "logs").sort();
+            if (dateKeys.length > 30) {
+              for (let i = 0; i < dateKeys.length - 30; i++) {
+                delete item.daily[dateKeys[i]];
+              }
+            }
+
+            // 智能探活与自动救火
+            if (item.backupUrl && item.activeTarget !== "backup") {
+              let inCooldown = false;
+              if (env.LINKS) {
+                const checkCooldownKey = "chk:" + path;
+                inCooldown = await env.LINKS.get(checkCooldownKey);
+                if (!inCooldown) {
+                  await env.LINKS.put(checkCooldownKey, "1", { expirationTtl: 900 });
+                }
+              }
+              if (!inCooldown) {
+                try {
+                  const checkResp = await fetch(item.url, {
+                    method: "GET",
+                    headers: {
+                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                    }
+                  });
+                  let isDead = false;
+                  if (checkResp.status === 404) {
+                    isDead = true;
+                  } else if (checkResp.ok) {
+                    const checkHtml = await checkResp.text();
+                    const invalidKeywords = ["分享已失效", "文件不存在", "已被取消", "包含违规内容", "分享已删除", "链接已失效"];
+                    for (let w of invalidKeywords) {
+                      if (checkHtml.includes(w)) {
+                        isDead = true;
+                        break;
+                      }
                     }
                   }
-                }
-                if (isDead) {
-                  item.activeTarget = "backup";
-                  item.autoSwitched = true;
-                  item.lastSwitchedAt = new Date().toLocaleString("zh-CN");
-                }
-              } catch (checkErr) {}
+                  if (isDead) {
+                    item.activeTarget = "backup";
+                    item.autoSwitched = true;
+                    item.lastSwitchedAt = new Date().toLocaleString("zh-CN");
+                  }
+                } catch (checkErr) {}
+              }
             }
-          }
 
-          // 3. 执行数据持久化
-          // A. 优先写入 D1 数据库（原子计数，支持当日字段跨天自愈更新）
-          if (isFromD1 && env.DB) {
-            await env.DB.prepare(`
-              UPDATE links SET
-                clicks = clicks + 1,
-                uv = uv + ?,
-                mobile_clicks = mobile_clicks + ?,
-                pc_clicks = pc_clicks + ?,
-                source_twitter = source_twitter + ?,
-                source_direct = source_direct + ?,
-                source_other = source_other + ?,
-                source_wechat = source_wechat + ?,
-                today_clicks = CASE WHEN today_date = ? THEN today_clicks + 1 ELSE 1 END,
-                today_uv = CASE WHEN today_date = ? THEN today_uv + ? ELSE ? END,
-                today_convert = CASE WHEN today_date = ? THEN today_convert ELSE 0 END,
-                today_date = ?,
-                active_target = ?,
-                auto_switched = ?,
-                last_switched_at = ?,
-                daily_json = ?
-              WHERE slug = ?
-            `).bind(
-              isNewUv ? 1 : 0,
-              isMobile ? 1 : 0,
-              isMobile ? 0 : 1,
-              sTwitter,
-              sDirect,
-              sOther,
-              sWechat,
-              todayDate,
-              todayDate,
-              isNewUv ? 1 : 0,
-              isNewUv ? 1 : 0,
-              todayDate,
-              todayDate,
-              item.activeTarget || "primary",
-              item.autoSwitched ? 1 : 0,
-              item.lastSwitchedAt || "",
-              JSON.stringify(item.daily),
-              path
-            ).run();
-          } else if (env.LINKS) {
-            // B. KV 数据库写入（带 5 分钟节流保护）
-            const throttleKey = "throttle:" + path + ":" + clientIp;
-            const inThrottle = !isNewUv && (await env.LINKS.get(throttleKey));
-            if (!inThrottle) {
-              await env.LINKS.put(throttleKey, "1", { expirationTtl: 300 });
+            // 执行真实流量持久化
+            if (isFromD1 && env.DB) {
+              await env.DB.prepare(`
+                UPDATE links SET
+                  clicks = clicks + 1,
+                  uv = uv + ?,
+                  mobile_clicks = mobile_clicks + ?,
+                  pc_clicks = pc_clicks + ?,
+                  source_twitter = source_twitter + ?,
+                  source_direct = source_direct + ?,
+                  source_other = source_other + ?,
+                  source_wechat = source_wechat + ?,
+                  today_clicks = CASE WHEN today_date = ? THEN today_clicks + 1 ELSE 1 END,
+                  today_uv = CASE WHEN today_date = ? THEN today_uv + ? ELSE ? END,
+                  today_convert = CASE WHEN today_date = ? THEN today_convert ELSE 0 END,
+                  today_date = ?,
+                  active_target = ?,
+                  auto_switched = ?,
+                  last_switched_at = ?,
+                  daily_json = ?
+                WHERE slug = ?
+              `).bind(
+                isNewUv ? 1 : 0,
+                isMobile ? 1 : 0,
+                isMobile ? 0 : 1,
+                sTwitter,
+                sDirect,
+                sOther,
+                sWechat,
+                todayDate,
+                todayDate,
+                isNewUv ? 1 : 0,
+                isNewUv ? 1 : 0,
+                todayDate,
+                todayDate,
+                item.activeTarget || "primary",
+                item.autoSwitched ? 1 : 0,
+                item.lastSwitchedAt || "",
+                JSON.stringify(item.daily),
+                path
+              ).run();
+            } else if (env.LINKS) {
+              const throttleKey = "throttle:" + path + ":" + clientIp;
+              const inThrottle = !isNewUv && (await env.LINKS.get(throttleKey));
+              if (!inThrottle) {
+                await env.LINKS.put(throttleKey, "1", { expirationTtl: 300 });
+                const targetKey = "link:" + path;
+                const todayStat = item.daily[todayDate] || { clicks: 0, uv: 0 };
+                await env.LINKS.put(targetKey, JSON.stringify(item), {
+                  metadata: {
+                    url: item.url,
+                    backupUrl: item.backupUrl || "",
+                    activeTarget: item.activeTarget || "primary",
+                    autoSwitched: !!item.autoSwitched,
+                    title: item.title,
+                    clicks: item.clicks,
+                    uv: item.uv,
+                    today: todayDate,
+                    todayClicks: todayStat.clicks || 0,
+                    todayUv: todayStat.uv || 0,
+                    sources: item.sources,
+                    devices: item.devices,
+                    createdAt: item.createdAt || "-"
+                  }
+                });
+              }
+            }
+          } else {
+            // 被拦截请求：仅将 logs 审计日志写入 daily_json，绝不递增任何点击与 UV 计数！
+            if (isFromD1 && env.DB) {
+              await env.DB.prepare("UPDATE links SET daily_json = ? WHERE slug = ?").bind(JSON.stringify(item.daily), path).run();
+            } else if (env.LINKS) {
               const targetKey = "link:" + path;
-              const todayStat = item.daily[todayDate] || { clicks: 0, uv: 0 };
-              await env.LINKS.put(targetKey, JSON.stringify(item), {
-                metadata: {
-                  url: item.url,
-                  backupUrl: item.backupUrl || "",
-                  activeTarget: item.activeTarget || "primary",
-                  autoSwitched: !!item.autoSwitched,
-                  title: item.title,
-                  clicks: item.clicks,
-                  uv: item.uv,
-                  today: todayDate,
-                  todayClicks: todayStat.clicks || 0,
-                  todayUv: todayStat.uv || 0,
-                  sources: item.sources,
-                  devices: item.devices,
-                  createdAt: item.createdAt || "-"
-                }
-              });
+              await env.LINKS.put(targetKey, JSON.stringify(item));
             }
           }
         } catch (e) {}
@@ -2892,6 +2962,19 @@ function renderAdminPage() {
         </div>
       </div>
 
+      <!-- 访客溯源与防伪审计卡片（让每一笔请求来源一目了然） -->
+      <div style="margin-top:14px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span style="font-size:12px;font-weight:700;color:#334155;display:flex;align-items:center;gap:4px;">
+            🛡️ 实时访客溯源与反作弊审计 (最近 10 次)
+          </span>
+          <span style="font-size:11px;color:#64748b;" id="statAuditLogCount">共 0 条</span>
+        </div>
+        <div id="statModalAuditLogs" style="max-height:160px;overflow-y:auto;font-size:11px;background:#fff;border:1px solid #e2e8f0;border-radius:6px;">
+          <div style="text-align:center;color:#94a3b8;padding:12px 0;">暂无访问或嗅探记录，短链纯净运行中</div>
+        </div>
+      </div>
+
       <!-- 底部快捷操作栏 -->
       <div class="modal-footer-dual">
         <div style="display:flex;gap:6px;flex-wrap:wrap;">
@@ -3594,30 +3677,67 @@ function renderAdminPage() {
           };
         }
 
-        // 7. 渲染最近 7 天 PV / UV 双柱趋势图及逐日明细清单
+        // 7. 渲染最近 7 天 PV / UV 双柱趋势图及逐日明细清单与访客审计日志
         renderDailyChart(item.daily || {});
+        renderAuditLogs((item.daily && item.daily.logs) || []);
 
         document.getElementById("statModal").style.display = "flex";
 
-        // 若尚未拉取过完整的 daily 数据，后台静默补拉
-        if (!item.daily || Object.keys(item.daily).length === 0) {
-          try {
-            var pwd = getPwd();
-            var resp = await fetch("/api/detail", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ pwd: pwd, slug: slug })
-            });
-            var data = await resp.json();
-            if (resp.ok && data.daily) {
-              item.daily = data.daily;
-              item.devices = data.devices || item.devices;
-              item.sources = data.sources || item.sources;
-              renderDailyChart(item.daily);
-              renderDeviceAndSourcesBars(item.devices, item, currentChannelMode);
-            }
-          } catch (e) {}
+        // 静默拉取最新深度画像与访客审计明细
+        try {
+          var pwd = getPwd();
+          var resp = await fetch("/api/detail", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ pwd: pwd, slug: slug })
+          });
+          var data = await resp.json();
+          if (resp.ok && data.daily) {
+            item.daily = data.daily;
+            item.devices = data.devices || item.devices;
+            item.sources = data.sources || item.sources;
+            renderDailyChart(item.daily);
+            renderDeviceAndSourcesBars(item.devices, item, currentChannelMode);
+            renderAuditLogs(item.daily.logs || []);
+          }
+        } catch (e) {}
+      }
+
+      // 渲染最近 10 次访问溯源与防伪审计日志
+      function renderAuditLogs(logs) {
+        var container = document.getElementById("statModalAuditLogs");
+        var countEl = document.getElementById("statAuditLogCount");
+        if (!container) return;
+        if (!logs || logs.length === 0) {
+          if (countEl) countEl.innerText = "共 0 条";
+          container.innerHTML = "<div style='text-align:center;color:#94a3b8;padding:12px 0;'>暂无访问或嗅探记录，短链纯净运行中</div>";
+          return;
         }
+        if (countEl) countEl.innerText = "共 " + logs.length + " 条近期记录";
+        var html = "";
+        for (var i = 0; i < logs.length; i++) {
+          var l = logs[i];
+          var isOk = l.counted === 1;
+          var statusBadge = isOk 
+            ? "<span style='color:#16a34a;background:#dcfce7;padding:1px 6px;border-radius:4px;font-weight:700;'>✅ 真实计入</span>"
+            : "<span style='color:#b45309;background:#fef3c7;padding:1px 6px;border-radius:4px;font-weight:700;'>🚫 " + (l.reason || "已拦截") + "</span>";
+
+          var countryTag = l.country ? (" (" + l.country + ")") : "";
+          var shortTime = (l.time || "").slice(5);
+
+          html += "<div style='padding:7px 10px;border-bottom:1px solid #f1f5f9;display:flex;flex-direction:column;gap:3px;'>" +
+            "<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px;'>" +
+              "<div style='display:flex;align-items:center;gap:6px;'>" +
+                statusBadge +
+                "<strong style='color:#1e293b;font-family:monospace;font-size:11px;'>" + l.ip + countryTag + "</strong>" +
+                "<span style='color:#64748b;font-size:10px;'>" + (l.device || "未知") + " · " + (l.source || "direct") + "</span>" +
+              "</div>" +
+              "<span style='color:#94a3b8;font-size:10px;font-family:monospace;'>" + shortTime + "</span>" +
+            "</div>" +
+            "<div style='color:#64748b;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + (l.ua || "") + "'>UA: " + (l.ua || "空") + "</div>" +
+          "</div>";
+        }
+        container.innerHTML = html;
       }
 
       function updateChannelTabsUI() {
