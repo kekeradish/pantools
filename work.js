@@ -133,7 +133,7 @@ export default {
       });
     }
 
-    // API：接收落地页真实转存与动作埋点上报（免密轻量接口，内置物理上限防刷与天/渠道精细归因）
+    // API：接收落地页真实转存与动作埋点上报（免密轻量接口，内置 1 个 IP / 设备当天至多计 1 次硬核防刷排重）
     if (path === "api/action" && request.method === "POST") {
       try {
         const body = await request.json();
@@ -141,7 +141,33 @@ export default {
         const srcChannel = (body && body.source || "direct").trim();
         const todayDate = getBeijingDateStr();
 
-        if (slug && env.DB) {
+        if (!slug) {
+          return Response.json({ success: false, error: "缺少参数 slug" });
+        }
+
+        // 1. 严格日级排重（1 个 IP / 1 台设备每天对该短链至多计入 1 次真实转存意图转化）
+        const clientIp = request.headers.get("cf-connecting-ip") || "127.0.0.1";
+        const cookieHeader = request.headers.get("cookie") || "";
+        const convCookieName = `_p_conv_${slug}_${todayDate}`;
+
+        let isNewConversion = !cookieHeader.includes(`${convCookieName}=1`);
+
+        if (env.LINKS && isNewConversion) {
+          const convKey = `conv:${slug}:${clientIp}:${todayDate}`;
+          const hasConverted = await env.LINKS.get(convKey);
+          if (hasConverted) {
+            isNewConversion = false;
+          } else {
+            await env.LINKS.put(convKey, "1", { expirationTtl: 86400 });
+          }
+        }
+
+        // 同一 IP / 设备今天已转存过：直接返回，绝不重复累计数据
+        if (!isNewConversion) {
+          return Response.json({ success: true, duplicate: true });
+        }
+
+        if (env.DB) {
           try {
             // 确保表结构包含转存与天维度列（自适应静默热补齐）
             try {
@@ -183,7 +209,14 @@ export default {
             }
           } catch (colErr) {}
         }
-        return Response.json({ success: true });
+
+        // 下发当日防重复转存 Cookie（有效期 1 天）
+        return new Response(JSON.stringify({ success: true, duplicate: false }), {
+          headers: {
+            "Content-Type": "application/json;charset=UTF-8",
+            "Set-Cookie": `${convCookieName}=1; Path=/; Max-Age=86400; SameSite=Lax`
+          }
+        });
       } catch (e) {
         return Response.json({ success: false });
       }
@@ -1758,7 +1791,28 @@ export default {
   </div>
 
   <script>
+    function reportAction(actionType) {
+      try {
+        var todayKey = "pan_conv_" + "${path}" + "_" + "${todayDate}";
+        if (localStorage.getItem(todayKey)) return;
+        localStorage.setItem(todayKey, "1");
+
+        var payload = JSON.stringify({ slug: "${path}", action: actionType, source: "wechat" });
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon("/api/action", payload);
+        } else {
+          fetch("/api/action", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: payload,
+            keepalive: true
+          }).catch(function() {});
+        }
+      } catch (e) {}
+    }
+
     document.getElementById("copyBtn").addEventListener("click", function() {
+      reportAction("copy");
       var url = "${safePrimaryUrl}";
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(url).then(function() {
@@ -2079,20 +2133,21 @@ export default {
 
     function reportAction(actionType) {
       try {
-        var storageKey = "pan_conv_" + "${path}";
+        var todayKey = "pan_conv_" + "${path}" + "_" + "${todayDate}";
         var alreadyReported = false;
         try {
-          if (sessionStorage.getItem(storageKey)) {
+          if (localStorage.getItem(todayKey) || sessionStorage.getItem(todayKey)) {
             alreadyReported = true;
           }
         } catch (storageErr) {}
 
-        // 同一访客在本次访问会话中，无论点击主链接、备用链接还是复制，只计 1 次真实转化！
+        // 同一访客在同一天内，无论点击主链接、备用链接还是多次点击复制，全天至多计 1 次真实转存！
         // 后续重复点击或多通道兼点直接拦截，坚决杜绝转化数失真与虚高！
         if (alreadyReported) return;
 
         try {
-          sessionStorage.setItem(storageKey, "1");
+          localStorage.setItem(todayKey, "1");
+          sessionStorage.setItem(todayKey, "1");
         } catch (storageErr) {}
 
         var payload = JSON.stringify({ slug: "${path}", action: actionType, source: currentTrafficSource });
