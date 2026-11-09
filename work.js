@@ -1993,6 +1993,14 @@ export default {
       border-color: #94a3b8;
     }
     .btn-copy-link:active { transform: scale(0.98); }
+    .copy-subtip {
+      display: block;
+      font-size: 11px;
+      font-weight: 400;
+      color: #64748b;
+      margin-top: 3px;
+      line-height: 1.35;
+    }
 
     .divider-wrap {
       display: flex;
@@ -2057,7 +2065,8 @@ export default {
           🚀 立即前往主网盘打开
         </a>
         <button type="button" class="btn-action btn-copy-link" id="copyPrimaryBtn">
-          📋 复制主网盘链接
+          <span>📋 复制主网盘链接</span>
+          <span class="copy-subtip">（打开失败可尝试复制链接在浏览器里尝试）</span>
         </button>
       </div>
     </div>
@@ -2082,7 +2091,8 @@ export default {
           🛡️ 前往备用网盘打开 (${backupBrand.name})
         </a>
         <button type="button" class="btn-action btn-copy-link" id="copyBackupBtn">
-          📋 复制备用网盘链接
+          <span>📋 复制备用网盘链接</span>
+          <span class="copy-subtip">（备用通道亦支持复制后在浏览器中打开）</span>
         </button>
       </div>
     </div>
@@ -2098,7 +2108,7 @@ export default {
   <script>
     function copyUrlWithToast(targetUrl, successMsg, btnEl) {
       var toast = document.getElementById("toastBox");
-      var originalText = btnEl.innerText;
+      var originalHtml = btnEl.innerHTML;
 
       function showSuccess() {
         toast.innerText = successMsg;
@@ -2106,7 +2116,7 @@ export default {
         btnEl.innerText = "✅ 复制成功！";
         setTimeout(function() {
           toast.style.display = "none";
-          btnEl.innerText = originalText;
+          btnEl.innerHTML = originalHtml;
         }, 2800);
       }
 
@@ -2702,6 +2712,9 @@ function renderAdminPage() {
     <div class="auth-sub">请输入管理密码以解锁短链与流量大屏</div>
     <input type="password" id="loginPwd" class="form-input" placeholder="输入专属管理密码" style="margin-bottom:16px;">
     <button type="button" class="btn btn-primary" id="loginBtn">登录工作台</button>
+    <div style="font-size:12px;color:var(--text-muted);margin-top:18px;text-align:center;">
+      📢 公众号：<strong style="color:var(--primary);">求知萝卜</strong>
+    </div>
   </div>
 
   <div class="app-container" id="dashBox">
@@ -2867,6 +2880,20 @@ function renderAdminPage() {
         </div>
       </div>
     </div>
+
+    <!-- 后台管理大屏专属底部公众号与版本信息 -->
+    <footer style="margin:26px 0 16px 0;text-align:center;font-size:12px;color:var(--text-muted);display:flex;flex-direction:column;align-items:center;gap:6px;">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:center;">
+        <span style="display:inline-flex;align-items:center;gap:5px;background:#f8fafc;padding:5px 14px;border-radius:9999px;border:1px solid #e2e8f0;color:#334155;font-weight:600;">
+          <span style="font-size:14px;">📢</span> 公众号：<strong style="color:var(--primary);">求知萝卜</strong>
+        </span>
+        <span style="color:#cbd5e1;">·</span>
+        <span>网盘防封与流量雷达系统</span>
+      </div>
+      <div style="font-size:11px;color:#94a3b8;">
+        PanTools Pro · 关注微信公众号【求知萝卜】获取最新网盘防封策略、爆款玩法与技术支持
+      </div>
+    </footer>
   </div>
 
   <!-- 多维数据与深度画像分析弹窗 -->
