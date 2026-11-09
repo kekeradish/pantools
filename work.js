@@ -2713,7 +2713,7 @@ function renderAdminPage() {
     <input type="password" id="loginPwd" class="form-input" placeholder="输入专属管理密码" style="margin-bottom:16px;">
     <button type="button" class="btn btn-primary" id="loginBtn">登录工作台</button>
     <div style="font-size:12px;color:var(--text-muted);margin-top:18px;text-align:center;">
-      📢 公众号：<strong style="color:var(--primary);">求知萝卜</strong>
+      公众号：求知萝卜
     </div>
   </div>
 
@@ -2881,18 +2881,9 @@ function renderAdminPage() {
       </div>
     </div>
 
-    <!-- 后台管理大屏专属底部公众号与版本信息 -->
-    <footer style="margin:26px 0 16px 0;text-align:center;font-size:12px;color:var(--text-muted);display:flex;flex-direction:column;align-items:center;gap:6px;">
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:center;">
-        <span style="display:inline-flex;align-items:center;gap:5px;background:#f8fafc;padding:5px 14px;border-radius:9999px;border:1px solid #e2e8f0;color:#334155;font-weight:600;">
-          <span style="font-size:14px;">📢</span> 公众号：<strong style="color:var(--primary);">求知萝卜</strong>
-        </span>
-        <span style="color:#cbd5e1;">·</span>
-        <span>网盘防封与流量雷达系统</span>
-      </div>
-      <div style="font-size:11px;color:#94a3b8;">
-        PanTools Pro · 关注微信公众号【求知萝卜】获取最新网盘防封策略、爆款玩法与技术支持
-      </div>
+    <!-- 后台管理大屏底部公众号信息 -->
+    <footer style="margin:24px 0 16px 0;text-align:center;font-size:12px;color:var(--text-muted);">
+      公众号：求知萝卜
     </footer>
   </div>
 
