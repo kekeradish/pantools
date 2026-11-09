@@ -2712,8 +2712,10 @@ function renderAdminPage() {
     <div class="auth-sub">请输入管理密码以解锁短链与流量大屏</div>
     <input type="password" id="loginPwd" class="form-input" placeholder="输入专属管理密码" style="margin-bottom:16px;">
     <button type="button" class="btn btn-primary" id="loginBtn">登录工作台</button>
-    <div style="font-size:12px;color:var(--text-muted);margin-top:18px;text-align:center;">
-      公众号：求知萝卜
+    <div style="margin-top:20px;padding-top:14px;border-top:1px solid #f1f5f9;display:flex;align-items:center;justify-content:center;gap:6px;font-size:12px;color:#64748b;">
+      <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#10b981;"></span>
+      <span>微信公众号：</span>
+      <strong style="color:var(--primary);font-weight:700;">求知萝卜</strong>
     </div>
   </div>
 
@@ -2881,9 +2883,15 @@ function renderAdminPage() {
       </div>
     </div>
 
-    <!-- 后台管理大屏底部公众号信息 -->
-    <footer style="margin:24px 0 16px 0;text-align:center;font-size:12px;color:var(--text-muted);">
-      公众号：求知萝卜
+    <!-- 后台管理大屏精致底部徽标 -->
+    <footer style="margin:28px 0 16px 0;text-align:center;">
+      <div style="display:inline-flex;align-items:center;gap:8px;padding:6px 18px;background:#ffffff;border:1px solid #e2e8f0;border-radius:9999px;box-shadow:0 1px 3px rgba(0,0,0,0.04);font-size:12px;color:#64748b;">
+        <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#10b981;box-shadow:0 0 0 2px #d1fae5;"></span>
+        <span style="color:#475569;">微信公众号</span>
+        <strong style="color:var(--primary);font-weight:700;letter-spacing:0.3px;">求知萝卜</strong>
+        <span style="color:#cbd5e1;margin:0 2px;">|</span>
+        <span style="color:#94a3b8;font-size:11px;">PanTools Pro</span>
+      </div>
     </footer>
   </div>
 
