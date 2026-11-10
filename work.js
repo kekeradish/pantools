@@ -31,6 +31,124 @@ export default {
       }
     }
 
+    // 统一爬虫、平台抓取器、安全审查沙箱与无头自动化探测器 UA 识别
+    function isBotUserAgent(ua) {
+      if (!ua || ua.length < 5) return true;
+      return /Twitterbot|facebookexternalhit|meta-externalagent|TelegramBot|Slackbot|Discordbot|WhatsApp|SkypeUriPreview|LinkedInBot|Pinterestbot|Pinterest\/|Applebot|Quora-Link-Preview|XBot|Bytespider|YisouSpider|Sogou|Baiduspider|Googlebot|bingbot|YandexBot|DuckDuckBot|bot|spider|crawl|slurp|curl|wget|python|java|httpclient|postman|go-http-client|reqwest|urllib|aiohttp|axios|node-fetch|undici|HeadlessChrome|Lighthouse|PTST|PhantomJS|Selenium|Puppeteer|Playwright|Cypress|WebDriver|SafeBrowsing|Scanner|Netcraft|Nmap|VirusTotal/i.test(ua);
+    }
+
+    // 生成并校验真实浏览器渲染活性信标签名（防止重放与脚本伪造）
+    async function getVisitSignature(pwd, vid, slug, ts) {
+      try {
+        const raw = `pan_vis_${pwd || "123456"}_${vid}_${slug}_${ts}`;
+        const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw));
+        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("").slice(0, 24);
+      } catch (e) {
+        return "pan_vis_fb_" + slug;
+      }
+    }
+
+    // 生成落地页通用的前端真实人类渲染活性确认脚本（彻底屏蔽仅抓取 HTML 的爬虫、无头与后台预加载）
+    function buildVisitBeaconScript(opts) {
+      const safeCfg = JSON.stringify({
+        slug: opts.slug || "",
+        vid: opts.vid || "",
+        ts: opts.ts || 0,
+        sig: opts.sig || "",
+        source: opts.source || "direct",
+        isMobile: !!opts.isMobile,
+        skip: !!opts.skip
+      });
+      return `
+  <script>
+    (function() {
+      var cfg = ${safeCfg};
+      window.__PAN_SKIP_COUNT__ = !!cfg.skip;
+      var visitPromise = null;
+      var visitSent = false;
+
+      function isHumanRenderedEnv() {
+        if (cfg.skip || window.__PAN_SKIP_COUNT__) return false;
+        try {
+          if (location.search && (location.search.indexOf("preview=") !== -1 || location.search.indexOf("admin_test") !== -1)) {
+            window.__PAN_SKIP_COUNT__ = true;
+            return false;
+          }
+          if (navigator.webdriver === true) return false;
+          if (/HeadlessChrome|PhantomJS|Selenium|Puppeteer|Playwright|Lighthouse/i.test(navigator.userAgent || "")) return false;
+          if (window.screen && (window.screen.width === 0 || window.screen.height === 0)) return false;
+          if (document.prerendering === true) return false;
+          if (document.visibilityState && document.visibilityState !== "visible") return false;
+        } catch (e) {}
+        return true;
+      }
+
+      window.__ensurePanVisit = function(forceImmediate) {
+        if (visitSent) return visitPromise || Promise.resolve();
+        if (cfg.skip || window.__PAN_SKIP_COUNT__) return Promise.resolve();
+        if (!forceImmediate && !isHumanRenderedEnv()) return Promise.resolve();
+        if (navigator.webdriver === true) return Promise.resolve();
+        if (document.visibilityState && document.visibilityState !== "visible" && !forceImmediate) return Promise.resolve();
+
+        visitSent = true;
+        var payload = JSON.stringify({
+          slug: cfg.slug,
+          vid: cfg.vid,
+          ts: cfg.ts,
+          sig: cfg.sig,
+          source: cfg.source,
+          isMobile: cfg.isMobile
+        });
+
+        try {
+          if (typeof fetch === "function") {
+            visitPromise = fetch("/api/visit", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: payload,
+              keepalive: true,
+              credentials: "same-origin"
+            }).catch(function() {});
+            return visitPromise;
+          } else if (navigator.sendBeacon) {
+            navigator.sendBeacon("/api/visit", new Blob([payload], { type: "application/json" }));
+          }
+        } catch (e) {}
+        return Promise.resolve();
+      };
+
+      function scheduleActiveBeacon() {
+        if (visitSent || !isHumanRenderedEnv()) return;
+        var fire = function() {
+          setTimeout(function() {
+            if (isHumanRenderedEnv()) {
+              window.__ensurePanVisit(false);
+            }
+          }, 180);
+        };
+        if (typeof requestAnimationFrame === "function") {
+          requestAnimationFrame(function() { fire(); });
+        } else {
+          fire();
+        }
+      }
+
+      if (!cfg.skip) {
+        if (document.visibilityState === "visible") {
+          scheduleActiveBeacon();
+        } else {
+          document.addEventListener("visibilitychange", function onVisChange() {
+            if (document.visibilityState === "visible") {
+              document.removeEventListener("visibilitychange", onVisChange);
+              scheduleActiveBeacon();
+            }
+          });
+        }
+      }
+    })();
+  </script>`;
+    }
+
     // 科学客观的渠道归因探测引擎（URL 推广参数 > 客户端 User-Agent 特征 > Referer 来源）
     function detectSourceChannel(req, requestUrl) {
       try {
@@ -133,9 +251,336 @@ export default {
       });
     }
 
-    // API：接收落地页真实转存与动作埋点上报（免密轻量接口，内置 1 个 IP / 设备当天至多计 1 次硬核防刷排重）
+    // API：接收落地页真实浏览器渲染活性确认信标（彻底杜绝平台机审、卡片爬虫、杀毒与预读产生假点击）
+    if (path === "api/visit" && request.method === "POST") {
+      try {
+        const ua = request.headers.get("user-agent") || "";
+        const cookieHeader = request.headers.get("cookie") || "";
+        const adminAuthExpected = await getAdminTokenHash(ADMIN_PASSWORD);
+
+        if (cookieHeader.includes(`_p_adm_auth=${adminAuthExpected}`) || isBotUserAgent(ua)) {
+          return Response.json({ success: true, skipped: true });
+        }
+
+        const body = await request.json();
+        const slug = (body && body.slug || "").trim();
+        const vid = (body && body.vid || "").trim();
+        const ts = parseInt(body && body.ts, 10) || 0;
+        const sig = (body && body.sig || "").trim();
+        const detectedChannel = (body && body.source || "direct").trim();
+        const isMobileClient = body && body.isMobile !== undefined
+          ? !!body.isMobile
+          : /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(ua);
+
+        if (!slug || !vid || !ts || !sig) {
+          return Response.json({ success: false, error: "参数不完整" }, { status: 400 });
+        }
+
+        // 校验时间戳有效性（24 小时内签发）与 HMAC 防伪签名
+        if (Math.abs(Date.now() - ts) > 86400 * 1000) {
+          return Response.json({ success: false, expired: true }, { status: 403 });
+        }
+        const expectedSig = await getVisitSignature(ADMIN_PASSWORD, vid, slug, ts);
+        if (sig !== expectedSig) {
+          return Response.json({ success: false, invalid: true }, { status: 403 });
+        }
+
+        // 单次访问令牌 KV 级快速幂等检查
+        if (env.LINKS) {
+          const visKey = "vis:" + vid;
+          const seen = await env.LINKS.get(visKey);
+          if (seen) {
+            return Response.json({ success: true, duplicate: true });
+          }
+          await env.LINKS.put(visKey, "1", { expirationTtl: 1800 });
+        }
+
+        let item = null;
+        let isFromD1 = false;
+        if (env.DB) {
+          try {
+            const d1Row = await env.DB.prepare("SELECT * FROM links WHERE slug = ?").bind(slug).first();
+            if (d1Row) {
+              isFromD1 = true;
+              let daily = {};
+              try { daily = d1Row.daily_json ? JSON.parse(d1Row.daily_json) : {}; } catch (e) {}
+              item = {
+                slug: d1Row.slug,
+                url: d1Row.url,
+                backupUrl: d1Row.backup_url || "",
+                activeTarget: d1Row.active_target || "primary",
+                autoSwitched: !!d1Row.auto_switched,
+                onlyMobile: !!d1Row.only_mobile,
+                title: d1Row.title || "资源分享直达",
+                clicks: d1Row.clicks || 0,
+                uv: d1Row.uv || 0,
+                createdAt: d1Row.created_at || "-",
+                lastSwitchedAt: d1Row.last_switched_at || "",
+                daily: daily,
+                devices: { mobile: d1Row.mobile_clicks || 0, pc: d1Row.pc_clicks || 0 },
+                sources: {
+                  wechat: d1Row.source_wechat || 0,
+                  twitter: d1Row.source_twitter || 0,
+                  direct: d1Row.source_direct || 0,
+                  other: d1Row.source_other || 0
+                }
+              };
+            }
+          } catch (e) {}
+        }
+
+        if (!item && env.LINKS) {
+          let storageKey = "link:" + slug;
+          let rawData = await env.LINKS.get(storageKey);
+          if (!rawData) {
+            storageKey = slug;
+            rawData = await env.LINKS.get(storageKey);
+          }
+          if (rawData) {
+            try {
+              item = JSON.parse(rawData);
+              item.slug = slug;
+            } catch (e) {}
+          }
+        }
+
+        if (!item) {
+          return Response.json({ success: false, error: "短链不存在" }, { status: 404 });
+        }
+
+        if (!item.daily) item.daily = {};
+        if (!Array.isArray(item.daily.logs)) item.daily.logs = [];
+
+        // 纯 D1 无 KV 场景下的日志级别二次幂等保护：避免同一次页面访问重复计数
+        const matchedLog = item.daily.logs.find(l => l && l.vid === vid);
+        if (matchedLog && matchedLog.counted === 1) {
+          return Response.json({ success: true, duplicate: true });
+        }
+
+        const todayDate = getBeijingDateStr();
+        const clientIp = request.headers.get("cf-connecting-ip") || "127.0.0.1";
+        const clientCountry = request.headers.get("cf-ipcountry") || "CN";
+        const nowBeijingTimeStr = new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace("T", " ").slice(0, 19);
+
+        // 将对应待确认记录原地升级为“真实有效访问”，若未匹配到则头部插入
+        if (matchedLog) {
+          matchedLog.counted = 1;
+          matchedLog.reason = "真实有效访问";
+          matchedLog.time = nowBeijingTimeStr;
+        } else {
+          item.daily.logs.unshift({
+            vid: vid,
+            time: nowBeijingTimeStr,
+            ip: clientIp,
+            country: clientCountry,
+            device: isMobileClient ? "手机端" : "电脑端",
+            source: detectedChannel,
+            ua: ua.slice(0, 120),
+            counted: 1,
+            reason: "真实有效访问"
+          });
+          if (item.daily.logs.length > 10) item.daily.logs.pop();
+        }
+
+        // 独立访客精准日级排重（浏览器 Cookie + KV IP 记录）
+        const uvCookieName = `_p_uv_${slug}_${todayDate}`;
+        let isNewUv = !cookieHeader.includes(`${uvCookieName}=1`);
+        if (env.LINKS && isNewUv) {
+          const uvKey = "uv:" + slug + ":" + clientIp + ":" + todayDate;
+          const hasVisited = await env.LINKS.get(uvKey);
+          if (hasVisited) {
+            isNewUv = false;
+          } else {
+            await env.LINKS.put(uvKey, "1", { expirationTtl: 86400 });
+          }
+        }
+
+        item.clicks = (item.clicks || 0) + 1;
+        if (isNewUv) item.uv = (item.uv || 0) + 1;
+
+        if (!item.sources) item.sources = { wechat: 0, twitter: 0, direct: 0, other: 0 };
+        let sTwitter = 0, sDirect = 0, sOther = 0, sWechat = 0;
+        if (detectedChannel === "wechat") {
+          item.sources.wechat = (item.sources.wechat || 0) + 1;
+          sWechat = 1;
+        } else if (detectedChannel === "twitter") {
+          item.sources.twitter = (item.sources.twitter || 0) + 1;
+          sTwitter = 1;
+        } else if (detectedChannel === "direct") {
+          item.sources.direct = (item.sources.direct || 0) + 1;
+          sDirect = 1;
+        } else {
+          item.sources.other = (item.sources.other || 0) + 1;
+          sOther = 1;
+        }
+
+        if (!item.devices) item.devices = { mobile: 0, pc: 0 };
+        if (isMobileClient) {
+          item.devices.mobile = (item.devices.mobile || 0) + 1;
+        } else {
+          item.devices.pc = (item.devices.pc || 0) + 1;
+        }
+
+        if (!item.daily[todayDate]) {
+          item.daily[todayDate] = {
+            clicks: 0,
+            uv: 0,
+            convert: 0,
+            mobile: 0,
+            pc: 0,
+            sources: { wechat: 0, twitter: 0, direct: 0, other: 0 },
+            convert_sources: { wechat: 0, twitter: 0, direct: 0, other: 0 }
+          };
+        }
+        item.daily[todayDate].clicks = (item.daily[todayDate].clicks || 0) + 1;
+        if (isMobileClient) {
+          item.daily[todayDate].mobile = (item.daily[todayDate].mobile || 0) + 1;
+        } else {
+          item.daily[todayDate].pc = (item.daily[todayDate].pc || 0) + 1;
+        }
+        if (isNewUv) {
+          item.daily[todayDate].uv = (item.daily[todayDate].uv || 0) + 1;
+        }
+        if (!item.daily[todayDate].sources) {
+          item.daily[todayDate].sources = { wechat: 0, twitter: 0, direct: 0, other: 0 };
+        }
+        item.daily[todayDate].sources[detectedChannel] = (item.daily[todayDate].sources[detectedChannel] || 0) + 1;
+
+        // 仅保留最近 30 天标准日期数据键，绝不误删 logs 等辅助字段
+        const dateKeys = Object.keys(item.daily).filter(k => /^\d{4}-\d{2}-\d{2}$/.test(k)).sort();
+        if (dateKeys.length > 30) {
+          for (let i = 0; i < dateKeys.length - 30; i++) {
+            delete item.daily[dateKeys[i]];
+          }
+        }
+
+        // 智能探活与自动救火（仅真实人类访问时触发，节省探活额度且不干扰机审）
+        if (item.backupUrl && item.activeTarget !== "backup") {
+          let inCooldown = false;
+          if (env.LINKS) {
+            const checkCooldownKey = "chk:" + slug;
+            inCooldown = await env.LINKS.get(checkCooldownKey);
+            if (!inCooldown) {
+              await env.LINKS.put(checkCooldownKey, "1", { expirationTtl: 900 });
+            }
+          }
+          if (!inCooldown) {
+            try {
+              const checkResp = await fetch(item.url, {
+                method: "GET",
+                headers: {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                }
+              });
+              let isDead = false;
+              if (checkResp.status === 404) {
+                isDead = true;
+              } else if (checkResp.ok) {
+                const checkHtml = await checkResp.text();
+                const invalidKeywords = ["分享已失效", "文件不存在", "已被取消", "包含违规内容", "分享已删除", "链接已失效"];
+                for (let w of invalidKeywords) {
+                  if (checkHtml.includes(w)) {
+                    isDead = true;
+                    break;
+                  }
+                }
+              }
+              if (isDead) {
+                item.activeTarget = "backup";
+                item.autoSwitched = true;
+                item.lastSwitchedAt = new Date().toLocaleString("zh-CN");
+              }
+            } catch (checkErr) {}
+          }
+        }
+
+        // 执行真实流量持久化
+        if (isFromD1 && env.DB) {
+          await env.DB.prepare(`
+            UPDATE links SET
+              clicks = clicks + 1,
+              uv = uv + ?,
+              mobile_clicks = mobile_clicks + ?,
+              pc_clicks = pc_clicks + ?,
+              source_twitter = source_twitter + ?,
+              source_direct = source_direct + ?,
+              source_other = source_other + ?,
+              source_wechat = source_wechat + ?,
+              today_clicks = CASE WHEN today_date = ? THEN today_clicks + 1 ELSE 1 END,
+              today_uv = CASE WHEN today_date = ? THEN today_uv + ? ELSE ? END,
+              today_convert = CASE WHEN today_date = ? THEN today_convert ELSE 0 END,
+              today_date = ?,
+              active_target = ?,
+              auto_switched = ?,
+              last_switched_at = ?,
+              daily_json = ?
+            WHERE slug = ?
+          `).bind(
+            isNewUv ? 1 : 0,
+            isMobileClient ? 1 : 0,
+            isMobileClient ? 0 : 1,
+            sTwitter,
+            sDirect,
+            sOther,
+            sWechat,
+            todayDate,
+            todayDate,
+            isNewUv ? 1 : 0,
+            isNewUv ? 1 : 0,
+            todayDate,
+            todayDate,
+            item.activeTarget || "primary",
+            item.autoSwitched ? 1 : 0,
+            item.lastSwitchedAt || "",
+            JSON.stringify(item.daily),
+            slug
+          ).run();
+        } else if (env.LINKS) {
+          const targetKey = "link:" + slug;
+          const todayStat = item.daily[todayDate] || { clicks: 0, uv: 0 };
+          await env.LINKS.put(targetKey, JSON.stringify(item), {
+            metadata: {
+              url: item.url,
+              backupUrl: item.backupUrl || "",
+              activeTarget: item.activeTarget || "primary",
+              autoSwitched: !!item.autoSwitched,
+              onlyMobile: !!item.onlyMobile,
+              title: item.title,
+              clicks: item.clicks,
+              uv: item.uv,
+              today: todayDate,
+              todayClicks: todayStat.clicks || 0,
+              todayUv: todayStat.uv || 0,
+              sources: item.sources,
+              devices: item.devices,
+              createdAt: item.createdAt || "-"
+            }
+          });
+        }
+
+        const visitHeaders = { "Content-Type": "application/json;charset=UTF-8" };
+        if (isNewUv) {
+          visitHeaders["Set-Cookie"] = `${uvCookieName}=1; Path=/; Max-Age=86400; SameSite=Lax`;
+        }
+        return new Response(JSON.stringify({ success: true, counted: true }), { headers: visitHeaders });
+      } catch (e) {
+        return Response.json({ success: false });
+      }
+    }
+
+    // API：接收落地页真实转存与动作埋点上报（免密轻量接口，内置管理员豁免 + 1 个 IP / 设备当天至多计 1 次防刷排重）
     if (path === "api/action" && request.method === "POST") {
       try {
+        const ua = request.headers.get("user-agent") || "";
+        const cookieHeader = request.headers.get("cookie") || "";
+        const adminTokenExpected = await getAdminTokenHash(ADMIN_PASSWORD);
+
+        // 管理员本人预览/测试点击复制，以及爬虫扫描触发直接豁免
+        if (cookieHeader.includes(`_p_adm_auth=${adminTokenExpected}`) || isBotUserAgent(ua)) {
+          return Response.json({ success: true, skipped: true });
+        }
+
         const body = await request.json();
         const slug = (body && body.slug || "").trim();
         const srcChannel = (body && body.source || "direct").trim();
@@ -147,7 +592,6 @@ export default {
 
         // 1. 严格日级排重（1 个 IP / 1 台设备每天对该短链至多计入 1 次真实转存意图转化）
         const clientIp = request.headers.get("cf-connecting-ip") || "127.0.0.1";
-        const cookieHeader = request.headers.get("cookie") || "";
         const convCookieName = `_p_conv_${slug}_${todayDate}`;
 
         let isNewConversion = !cookieHeader.includes(`${convCookieName}=1`);
@@ -186,17 +630,19 @@ export default {
               let daily = {};
               try { daily = row.daily_json ? JSON.parse(row.daily_json) : {}; } catch (e) {}
               if (!daily[todayDate]) {
-                daily[todayDate] = { clicks: 1, uv: 1, convert: 0, mobile: 0, pc: 0, sources: {}, convert_sources: {} };
+                daily[todayDate] = { clicks: 0, uv: 0, convert: 0, mobile: 0, pc: 0, sources: {}, convert_sources: {} };
               }
               if (!daily[todayDate].convert_sources) daily[todayDate].convert_sources = {};
 
-              const dayClicks = Math.max(1, daily[todayDate].clicks || 1);
-              daily[todayDate].convert = Math.min(dayClicks, (daily[todayDate].convert || 0) + 1);
-              daily[todayDate].convert_sources[srcChannel] = (daily[todayDate].convert_sources[srcChannel] || 0) + 1;
+              const dayClicks = daily[todayDate].clicks || 0;
+              if (dayClicks > 0) {
+                daily[todayDate].convert = Math.min(dayClicks, (daily[todayDate].convert || 0) + 1);
+                daily[todayDate].convert_sources[srcChannel] = (daily[todayDate].convert_sources[srcChannel] || 0) + 1;
+              }
 
               const isSameDay = row.today_date === todayDate;
-              const newTodayClicks = isSameDay ? (row.today_clicks || 0) : 1;
-              const newTodayConvert = isSameDay ? Math.min(newTodayClicks, (row.today_convert || 0) + 1) : 1;
+              const newTodayClicks = isSameDay ? (row.today_clicks || 0) : 0;
+              const newTodayConvert = isSameDay ? Math.min(newTodayClicks, (row.today_convert || 0) + 1) : 0;
 
               await env.DB.prepare(`
                 UPDATE links SET
@@ -208,6 +654,25 @@ export default {
               `).bind(newTodayConvert, todayDate, JSON.stringify(daily), slug).run();
             }
           } catch (colErr) {}
+        } else if (env.LINKS) {
+          try {
+            const raw = (await env.LINKS.get("link:" + slug)) || (await env.LINKS.get(slug));
+            if (raw) {
+              const item = JSON.parse(raw);
+              if (!item.daily) item.daily = {};
+              if (!item.daily[todayDate]) {
+                item.daily[todayDate] = { clicks: 0, uv: 0, convert: 0, mobile: 0, pc: 0, sources: {}, convert_sources: {} };
+              }
+              if (!item.daily[todayDate].convert_sources) item.daily[todayDate].convert_sources = {};
+              const dayClicks = item.daily[todayDate].clicks || 0;
+              if (dayClicks > 0) {
+                item.daily[todayDate].convert = Math.min(dayClicks, (item.daily[todayDate].convert || 0) + 1);
+                item.daily[todayDate].convert_sources[srcChannel] = (item.daily[todayDate].convert_sources[srcChannel] || 0) + 1;
+              }
+              item.convertClicks = Math.min(item.clicks || 0, (item.convertClicks || 0) + 1);
+              await env.LINKS.put("link:" + slug, JSON.stringify(item));
+            }
+          } catch (kvColErr) {}
         }
 
         // 下发当日防重复转存 Cookie（有效期 1 天）
@@ -469,6 +934,8 @@ export default {
             key.name.startsWith("link:") ||
             key.name.startsWith("uv_") ||
             key.name.startsWith("uv:") ||
+            key.name.startsWith("conv:") ||
+            key.name.startsWith("vis:") ||
             key.name.startsWith("ratelimit:") ||
             key.name.startsWith("throttle:") ||
             key.name.startsWith("chk:")
@@ -520,7 +987,7 @@ export default {
               convertClicks: parsed.convertClicks || 0,
               todayClicks: todayStats.clicks || 0,
               todayUv: todayStats.uv || 0,
-              sources: parsed.sources || { twitter: 0, direct: 0, other: 0 },
+              sources: parsed.sources || { wechat: 0, twitter: 0, direct: 0, other: 0 },
               devices: parsed.devices || { mobile: 0, pc: 0 },
               daily: daily,
               createdAt: parsed.createdAt || "-",
@@ -590,6 +1057,7 @@ export default {
                 daily: daily,
                 devices: { mobile: row.mobile_clicks || 0, pc: row.pc_clicks || 0 },
                 sources: {
+                  wechat: row.source_wechat || 0,
                   twitter: row.source_twitter || 0,
                   direct: row.source_direct || 0,
                   other: row.source_other || 0
@@ -607,7 +1075,7 @@ export default {
               success: true,
               daily: parsed.daily || {},
               devices: parsed.devices || { mobile: 0, pc: 0 },
-              sources: parsed.sources || { twitter: 0, direct: 0, other: 0 }
+              sources: parsed.sources || { wechat: 0, twitter: 0, direct: 0, other: 0 }
             });
           }
         }
@@ -693,7 +1161,7 @@ export default {
           title: finalTitle,
           clicks: 0,
           uv: 0,
-          sources: { twitter: 0, direct: 0, other: 0 },
+          sources: { wechat: 0, twitter: 0, direct: 0, other: 0 },
           devices: { mobile: 0, pc: 0 },
           daily: {
             [todayDate]: { clicks: 0, uv: 0, mobile: 0, pc: 0 }
@@ -854,7 +1322,7 @@ export default {
                   uv: d1Row.uv || 0,
                   todayClicks: todayStats.clicks || 0,
                   todayUv: todayStats.uv || 0,
-                  sources: { twitter: d1Row.source_twitter || 0, direct: d1Row.source_direct || 0, other: d1Row.source_other || 0 },
+                  sources: { wechat: d1Row.source_wechat || 0, twitter: d1Row.source_twitter || 0, direct: d1Row.source_direct || 0, other: d1Row.source_other || 0 },
                   devices: { mobile: d1Row.mobile_clicks || 0, pc: d1Row.pc_clicks || 0 },
                   daily: daily,
                   createdAt: d1Row.created_at || "-",
@@ -1106,6 +1574,7 @@ export default {
             daily: daily,
             devices: { mobile: d1Row.mobile_clicks || 0, pc: d1Row.pc_clicks || 0 },
             sources: {
+              wechat: d1Row.source_wechat || 0,
               twitter: d1Row.source_twitter || 0,
               direct: d1Row.source_direct || 0,
               other: d1Row.source_other || 0
@@ -1150,8 +1619,8 @@ export default {
     }
 
     const userAgent = request.headers.get("user-agent") || "";
-    // 2. 爬虫、自动化探针与无 UA 请求过滤（覆盖无 UA、HeadlessChrome、安全扫描器等）
-    const isBot = !userAgent || userAgent.length < 5 || /Twitterbot|facebookexternalhit|TelegramBot|bot|spider|crawl|slurp|curl|wget|python|java|bytespider|yisouspider|sogou|httpclient|postman|go-http-client|HeadlessChrome|Lighthouse|PTST|PhantomJS|Selenium|Puppeteer|SafeBrowsing|Scanner|Netcraft|Nmap/i.test(userAgent);
+    // 2. 爬虫、平台抓取器、安全审查沙箱与自动化探针过滤
+    const isBot = isBotUserAgent(userAgent);
 
     // 3. 浏览器静默投机预加载检测（Chrome/Edge Speculative Rules / Prefetch / Prerender 等后台静默预读取）
     const purpose = (request.headers.get("purpose") || "").toLowerCase();
@@ -1192,7 +1661,7 @@ export default {
       blockReason = "扩展/脚本后台嗅探";
     }
 
-    const shouldCount = !blockReason;
+    const shouldCountCandidate = !blockReason;
 
     const isWechat = /MicroMessenger/i.test(userAgent);
     const isQQ = /QQ\//i.test(userAgent);
@@ -1201,231 +1670,78 @@ export default {
     const todayDate = getBeijingDateStr();
     const detectedChannel = detectSourceChannel(request, url);
 
-    // 独立访客精准客观去重（Cookie 浏览器指纹 + KV 辅助去重，彻底消除纯 D1 模式下 UV 锁死为 1 的漏洞）
-    const uvCookieName = `_p_uv_${path}_${todayDate}`;
-    let isNewUv = !cookieHeader.includes(`${uvCookieName}=1`);
+    // 为每一次外部页面访问派发专属防伪活性令牌（防止重放，并在客户端可见渲染后确认计入）
+    const visitId = "v" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    const visitTs = Date.now();
+    const visitSig = await getVisitSignature(ADMIN_PASSWORD, visitId, path, visitTs);
 
-    // 异步安全记录与更新（无论是真实访客还是被拦截探针，均写入最近审计日志溯源）
-    if (ctx && ctx.waitUntil) {
-      const updateTask = async () => {
-        try {
-          const clientIp = request.headers.get("cf-connecting-ip") || "127.0.0.1";
-          const clientCountry = request.headers.get("cf-ipcountry") || "CN";
-          const nowBeijingTimeStr = new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace("T", " ").slice(0, 19);
+    const clientIp = request.headers.get("cf-connecting-ip") || "127.0.0.1";
+    const clientCountry = request.headers.get("cf-ipcountry") || "CN";
+    const nowBeijingTimeStr = new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace("T", " ").slice(0, 19);
 
-          // 记录访问溯源审计日志（保留最近 10 次真实/拦截记录）
-          const logEntry = {
-            time: nowBeijingTimeStr,
-            ip: clientIp,
-            country: clientCountry,
-            device: isMobile ? "手机端" : "电脑端",
-            source: detectedChannel,
-            ua: userAgent.slice(0, 120),
-            counted: shouldCount ? 1 : 0,
-            reason: blockReason || "真实有效访问"
-          };
+    if (!item.daily) item.daily = {};
+    if (!Array.isArray(item.daily.logs)) item.daily.logs = [];
 
-          if (!item.daily) item.daily = {};
-          if (!item.daily.logs) item.daily.logs = [];
-          item.daily.logs.unshift(logEntry);
-          if (item.daily.logs.length > 10) item.daily.logs.pop();
+    if (!shouldCountCandidate) {
+      // 明确被拦截请求：异步写入审计日志记录来源与拦截原因，页面完全免除信标上报
+      if (ctx && ctx.waitUntil) {
+        ctx.waitUntil((async () => {
+          try {
+            item.daily.logs.unshift({
+              vid: visitId,
+              time: nowBeijingTimeStr,
+              ip: clientIp,
+              country: clientCountry,
+              device: isMobile ? "手机端" : "电脑端",
+              source: detectedChannel,
+              ua: userAgent.slice(0, 120),
+              counted: 0,
+              reason: blockReason || "已拦截"
+            });
+            if (item.daily.logs.length > 10) item.daily.logs.pop();
 
-          // 仅在真实外部访客时递增统计指标
-          if (shouldCount) {
-            if (env.LINKS && isNewUv) {
-              const uvKey = "uv:" + path + ":" + clientIp + ":" + todayDate;
-              const hasVisited = await env.LINKS.get(uvKey);
-              if (hasVisited) {
-                isNewUv = false;
-              } else {
-                await env.LINKS.put(uvKey, "1", { expirationTtl: 86400 });
-              }
-            }
-
-            // 统计增量更新
-            item.clicks = (item.clicks || 0) + 1;
-            if (isNewUv) item.uv = (item.uv || 0) + 1;
-
-            // 渠道统计拆解
-            if (!item.sources) item.sources = { wechat: 0, twitter: 0, direct: 0, other: 0 };
-            let sTwitter = 0, sDirect = 0, sOther = 0, sWechat = 0;
-            if (detectedChannel === "wechat") {
-              item.sources.wechat = (item.sources.wechat || 0) + 1;
-              sWechat = 1;
-            } else if (detectedChannel === "twitter") {
-              item.sources.twitter = (item.sources.twitter || 0) + 1;
-              sTwitter = 1;
-            } else if (detectedChannel === "direct") {
-              item.sources.direct = (item.sources.direct || 0) + 1;
-              sDirect = 1;
-            } else {
-              item.sources.other = (item.sources.other || 0) + 1;
-              sOther = 1;
-            }
-
-            // 手机 vs 电脑 设备统计
-            if (!item.devices) item.devices = { mobile: 0, pc: 0 };
-            if (isMobile) {
-              item.devices.mobile = (item.devices.mobile || 0) + 1;
-            } else {
-              item.devices.pc = (item.devices.pc || 0) + 1;
-            }
-
-            // 按日维度增量统计
-            if (!item.daily[todayDate]) {
-              item.daily[todayDate] = {
-                clicks: 0,
-                uv: 0,
-                convert: 0,
-                mobile: 0,
-                pc: 0,
-                sources: { wechat: 0, twitter: 0, direct: 0, other: 0 },
-                convert_sources: { wechat: 0, twitter: 0, direct: 0, other: 0 }
-              };
-            }
-            item.daily[todayDate].clicks = (item.daily[todayDate].clicks || 0) + 1;
-            if (isMobile) {
-              item.daily[todayDate].mobile = (item.daily[todayDate].mobile || 0) + 1;
-            } else {
-              item.daily[todayDate].pc = (item.daily[todayDate].pc || 0) + 1;
-            }
-            if (isNewUv) {
-              item.daily[todayDate].uv = (item.daily[todayDate].uv || 0) + 1;
-            }
-            if (!item.daily[todayDate].sources) {
-              item.daily[todayDate].sources = { wechat: 0, twitter: 0, direct: 0, other: 0 };
-            }
-            item.daily[todayDate].sources[detectedChannel] = (item.daily[todayDate].sources[detectedChannel] || 0) + 1;
-
-            // 清理 30 天之前的陈旧日期记录
-            const dateKeys = Object.keys(item.daily).filter(k => k !== "logs").sort();
-            if (dateKeys.length > 30) {
-              for (let i = 0; i < dateKeys.length - 30; i++) {
-                delete item.daily[dateKeys[i]];
-              }
-            }
-
-            // 智能探活与自动救火
-            if (item.backupUrl && item.activeTarget !== "backup") {
-              let inCooldown = false;
-              if (env.LINKS) {
-                const checkCooldownKey = "chk:" + path;
-                inCooldown = await env.LINKS.get(checkCooldownKey);
-                if (!inCooldown) {
-                  await env.LINKS.put(checkCooldownKey, "1", { expirationTtl: 900 });
-                }
-              }
-              if (!inCooldown) {
-                try {
-                  const checkResp = await fetch(item.url, {
-                    method: "GET",
-                    headers: {
-                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-                    }
-                  });
-                  let isDead = false;
-                  if (checkResp.status === 404) {
-                    isDead = true;
-                  } else if (checkResp.ok) {
-                    const checkHtml = await checkResp.text();
-                    const invalidKeywords = ["分享已失效", "文件不存在", "已被取消", "包含违规内容", "分享已删除", "链接已失效"];
-                    for (let w of invalidKeywords) {
-                      if (checkHtml.includes(w)) {
-                        isDead = true;
-                        break;
-                      }
-                    }
-                  }
-                  if (isDead) {
-                    item.activeTarget = "backup";
-                    item.autoSwitched = true;
-                    item.lastSwitchedAt = new Date().toLocaleString("zh-CN");
-                  }
-                } catch (checkErr) {}
-              }
-            }
-
-            // 执行真实流量持久化
-            if (isFromD1 && env.DB) {
-              await env.DB.prepare(`
-                UPDATE links SET
-                  clicks = clicks + 1,
-                  uv = uv + ?,
-                  mobile_clicks = mobile_clicks + ?,
-                  pc_clicks = pc_clicks + ?,
-                  source_twitter = source_twitter + ?,
-                  source_direct = source_direct + ?,
-                  source_other = source_other + ?,
-                  source_wechat = source_wechat + ?,
-                  today_clicks = CASE WHEN today_date = ? THEN today_clicks + 1 ELSE 1 END,
-                  today_uv = CASE WHEN today_date = ? THEN today_uv + ? ELSE ? END,
-                  today_convert = CASE WHEN today_date = ? THEN today_convert ELSE 0 END,
-                  today_date = ?,
-                  active_target = ?,
-                  auto_switched = ?,
-                  last_switched_at = ?,
-                  daily_json = ?
-                WHERE slug = ?
-              `).bind(
-                isNewUv ? 1 : 0,
-                isMobile ? 1 : 0,
-                isMobile ? 0 : 1,
-                sTwitter,
-                sDirect,
-                sOther,
-                sWechat,
-                todayDate,
-                todayDate,
-                isNewUv ? 1 : 0,
-                isNewUv ? 1 : 0,
-                todayDate,
-                todayDate,
-                item.activeTarget || "primary",
-                item.autoSwitched ? 1 : 0,
-                item.lastSwitchedAt || "",
-                JSON.stringify(item.daily),
-                path
-              ).run();
-            } else if (env.LINKS) {
-              const throttleKey = "throttle:" + path + ":" + clientIp;
-              const inThrottle = !isNewUv && (await env.LINKS.get(throttleKey));
-              if (!inThrottle) {
-                await env.LINKS.put(throttleKey, "1", { expirationTtl: 300 });
-                const targetKey = "link:" + path;
-                const todayStat = item.daily[todayDate] || { clicks: 0, uv: 0 };
-                await env.LINKS.put(targetKey, JSON.stringify(item), {
-                  metadata: {
-                    url: item.url,
-                    backupUrl: item.backupUrl || "",
-                    activeTarget: item.activeTarget || "primary",
-                    autoSwitched: !!item.autoSwitched,
-                    title: item.title,
-                    clicks: item.clicks,
-                    uv: item.uv,
-                    today: todayDate,
-                    todayClicks: todayStat.clicks || 0,
-                    todayUv: todayStat.uv || 0,
-                    sources: item.sources,
-                    devices: item.devices,
-                    createdAt: item.createdAt || "-"
-                  }
-                });
-              }
-            }
-          } else {
-            // 被拦截请求：仅将 logs 审计日志写入 daily_json，绝不递增任何点击与 UV 计数！
             if (isFromD1 && env.DB) {
               await env.DB.prepare("UPDATE links SET daily_json = ? WHERE slug = ?").bind(JSON.stringify(item.daily), path).run();
             } else if (env.LINKS) {
-              const targetKey = "link:" + path;
-              await env.LINKS.put(targetKey, JSON.stringify(item));
+              await env.LINKS.put("link:" + path, JSON.stringify(item));
             }
-          }
-        } catch (e) {}
-      };
-      ctx.waitUntil(updateTask());
+          } catch (e) {}
+        })());
+      }
+    } else {
+      // 通过初筛的外部请求：先在 daily.logs 中写入一条待渲染确认的审计初始记录（此时绝对不递增任何 clicks / uv 统计！）
+      // 唯有真实浏览器在客户端完成可见渲染绘制并上报 /api/visit 活性信标后，该条记录才会被升级为有效访问并正式累计数据
+      try {
+        item.daily.logs.unshift({
+          vid: visitId,
+          time: nowBeijingTimeStr,
+          ip: clientIp,
+          country: clientCountry,
+          device: isMobile ? "手机端" : "电脑端",
+          source: detectedChannel,
+          ua: userAgent.slice(0, 120),
+          counted: 0,
+          reason: "仅抓取HTML(待页面渲染确认)"
+        });
+        if (item.daily.logs.length > 10) item.daily.logs.pop();
+
+        if (isFromD1 && env.DB) {
+          await env.DB.prepare("UPDATE links SET daily_json = ? WHERE slug = ?").bind(JSON.stringify(item.daily), path).run();
+        } else if (env.LINKS) {
+          await env.LINKS.put("link:" + path, JSON.stringify(item));
+        }
+      } catch (e) {}
     }
+
+    const beaconScript = buildVisitBeaconScript({
+      slug: path,
+      vid: visitId,
+      ts: visitTs,
+      sig: visitSig,
+      source: detectedChannel,
+      isMobile: isMobile,
+      skip: !shouldCountCandidate
+    });
 
     // 主链接与备用链接多通道解析
     const safePrimaryUrl = escapeHtml(item.url);
@@ -1522,13 +1838,6 @@ export default {
       flex-direction: column;
       align-items: center;
       margin-bottom: 18px;
-    }
-    .qr-img {
-      width: 200px;
-      height: 200px;
-      display: block;
-      border-radius: 10px;
-      background: #ffffff;
     }
     .qr-tip {
       font-size: 13px;
@@ -1627,12 +1936,13 @@ export default {
       }
     });
   </script>
+  ${beaconScript}
 </body>
 </html>`;
       return new Response(qrHtml, {
         headers: {
           "content-type": "text/html;charset=UTF-8",
-          "cache-control": "public, max-age=15, stale-while-revalidate=30"
+          "cache-control": "private, no-cache, no-store, must-revalidate"
         }
       });
     }
@@ -1792,21 +2102,31 @@ export default {
 
   <script>
     function reportAction(actionType) {
+      if (window.__PAN_SKIP_COUNT__) return;
       try {
         var todayKey = "pan_conv_" + "${path}" + "_" + "${todayDate}";
         if (localStorage.getItem(todayKey)) return;
         localStorage.setItem(todayKey, "1");
 
-        var payload = JSON.stringify({ slug: "${path}", action: actionType, source: "wechat" });
-        if (navigator.sendBeacon) {
-          navigator.sendBeacon("/api/action", payload);
+        function doSendAction() {
+          var payload = JSON.stringify({ slug: "${path}", action: actionType, source: "wechat" });
+          if (typeof fetch === "function") {
+            fetch("/api/action", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: payload,
+              keepalive: true,
+              credentials: "same-origin"
+            }).catch(function() {});
+          } else if (navigator.sendBeacon) {
+            navigator.sendBeacon("/api/action", new Blob([payload], { type: "application/json" }));
+          }
+        }
+
+        if (typeof window.__ensurePanVisit === "function") {
+          Promise.resolve(window.__ensurePanVisit(true)).then(doSendAction, doSendAction);
         } else {
-          fetch("/api/action", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: payload,
-            keepalive: true
-          }).catch(function() {});
+          doSendAction();
         }
       } catch (e) {}
     }
@@ -1829,12 +2149,13 @@ export default {
       }
     });
   </script>
+  ${beaconScript}
 </body>
 </html>`;
       return new Response(wechatHtml, {
         headers: {
           "content-type": "text/html;charset=UTF-8",
-          "cache-control": "public, max-age=15, stale-while-revalidate=30"
+          "cache-control": "private, no-cache, no-store, must-revalidate"
         }
       });
     }
@@ -2142,6 +2463,7 @@ export default {
     var currentTrafficSource = "${detectedChannel}";
 
     function reportAction(actionType) {
+      if (window.__PAN_SKIP_COUNT__) return;
       try {
         var todayKey = "pan_conv_" + "${path}" + "_" + "${todayDate}";
         var alreadyReported = false;
@@ -2160,16 +2482,25 @@ export default {
           sessionStorage.setItem(todayKey, "1");
         } catch (storageErr) {}
 
-        var payload = JSON.stringify({ slug: "${path}", action: actionType, source: currentTrafficSource });
-        if (navigator.sendBeacon) {
-          navigator.sendBeacon("/api/action", payload);
+        function doSendAction() {
+          var payload = JSON.stringify({ slug: "${path}", action: actionType, source: currentTrafficSource });
+          if (typeof fetch === "function") {
+            fetch("/api/action", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: payload,
+              keepalive: true,
+              credentials: "same-origin"
+            }).catch(function() {});
+          } else if (navigator.sendBeacon) {
+            navigator.sendBeacon("/api/action", new Blob([payload], { type: "application/json" }));
+          }
+        }
+
+        if (typeof window.__ensurePanVisit === "function") {
+          Promise.resolve(window.__ensurePanVisit(true)).then(doSendAction, doSendAction);
         } else {
-          fetch("/api/action", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: payload,
-            keepalive: true
-          }).catch(function() {});
+          doSendAction();
         }
       } catch (e) {}
     }
@@ -2204,18 +2535,16 @@ export default {
       });
     }
   </script>
+  ${beaconScript}
 </body>
 </html>`;
 
-    const respHeaders = {
-      "content-type": "text/html;charset=UTF-8",
-      "cache-control": "public, max-age=15, stale-while-revalidate=30"
-    };
-    if (shouldCount && isNewUv) {
-      respHeaders["Set-Cookie"] = `_p_uv_${path}_${todayDate}=1; Path=/; Max-Age=86400; SameSite=Lax`;
-    }
-
-    return new Response(jumpHtml, { headers: respHeaders });
+    return new Response(jumpHtml, {
+      headers: {
+        "content-type": "text/html;charset=UTF-8",
+        "cache-control": "private, no-cache, no-store, must-revalidate"
+      }
+    });
   }
 };
 
@@ -3385,6 +3714,16 @@ function renderAdminPage() {
         }, 300);
       }
 
+      function escHtml(s) {
+        if (s === null || s === undefined) return "";
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
       // 精简自适应无挤压表格
       function renderTable(items) {
         var tbody = document.getElementById("listBody");
@@ -3398,6 +3737,12 @@ function renderAdminPage() {
           var brand = item.brand || { name: "网盘资源", color: "#475569", bg: "#f1f5f9" };
           var todayPv = item.todayClicks || 0;
           var totalPv = item.clicks || 0;
+          var safeTitleText = escHtml(item.title || "");
+          var safeUrlText = escHtml(item.url || "");
+          var safeShortUrl = escHtml(item.shortUrl || "");
+          var safeSlug = escHtml(item.slug || "");
+          var safeBackup = escHtml(item.backupUrl || "");
+          var safeBrandName = escHtml(brand.name || "网盘资源");
 
           var rankBadge = "";
           if (currentPage === 1 && ((currentSort === "today" && todayPv > 0) || (currentSort === "total" && totalPv > 0))) {
@@ -3421,27 +3766,27 @@ function renderAdminPage() {
             "<td>" +
               "<div style='display:flex;align-items:center;margin-bottom:3px;'>" +
                 rankBadge +
-                "<span class='brand-tag' style='background:" + brand.bg + ";color:" + brand.color + ";'>" + brand.name + "</span>" +
-                "<span style='font-weight:700;color:#1e293b;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + item.title + "'>" + item.title + "</span>" +
+                "<span class='brand-tag' style='background:" + brand.bg + ";color:" + brand.color + ";'>" + safeBrandName + "</span>" +
+                "<span style='font-weight:700;color:#1e293b;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + safeTitleText + "'>" + safeTitleText + "</span>" +
                 backupPill +
               "</div>" +
-              "<div style='font-size:11px;color:var(--text-muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + item.url + "'>目标: " + item.url + "</div>" +
+              "<div style='font-size:11px;color:var(--text-muted);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + safeUrlText + "'>目标: " + safeUrlText + "</div>" +
             "</td>" +
             "<td>" +
-              "<div><a href='" + item.shortUrl + "?preview=1' target='_blank' rel='nofollow no-prefetch noreferrer noopener' style='color:var(--primary);text-decoration:none;font-weight:700;font-size:12px;display:inline-block;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + item.shortUrl + "'>" + item.shortUrl + "</a></div>" +
+              "<div><a href='" + safeShortUrl + "?preview=1' target='_blank' rel='nofollow no-prefetch noreferrer noopener' style='color:var(--primary);text-decoration:none;font-weight:700;font-size:12px;display:inline-block;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + safeShortUrl + "'>" + safeShortUrl + "</a></div>" +
               "<div style='margin-top:4px;'>" +
                 "<div class='device-segmented-group'>" +
-                  "<button type='button' class='btn-segment" + (!item.onlyMobile ? " active" : "") + "' data-slug='" + item.slug + "' data-target-mobile='0' title='允许所有设备（电脑和手机）直接访问网盘'>" +
+                  "<button type='button' class='btn-segment" + (!item.onlyMobile ? " active" : "") + "' data-slug='" + safeSlug + "' data-target-mobile='0' title='允许所有设备（电脑和手机）直接访问网盘'>" +
                     "🌐 全设备" +
                   "</button>" +
-                  "<button type='button' class='btn-segment" + (item.onlyMobile ? " active-mobile" : "") + "' data-slug='" + item.slug + "' data-target-mobile='1' title='仅限手机端访问（电脑端打开展示扫码二维码）'>" +
+                  "<button type='button' class='btn-segment" + (item.onlyMobile ? " active-mobile" : "") + "' data-slug='" + safeSlug + "' data-target-mobile='1' title='仅限手机端访问（电脑端打开展示扫码二维码）'>" +
                     "📱 仅手机" +
                   "</button>" +
                 "</div>" +
               "</div>" +
             "</td>" +
             "<td>" +
-              "<div class='traffic-pill' data-slug='" + item.slug + "' title='点击查看深度流量分析'>" +
+              "<div class='traffic-pill' data-slug='" + safeSlug + "' title='点击查看深度流量分析'>" +
                 "<span>今日 <strong class='pill-today'>" + todayPv + "</strong></span>" +
                 "<span style='color:#cbd5e1;'>/</span>" +
                 "<span>总 <strong class='pill-total'>" + totalPv + "</strong></span>" +
@@ -3455,13 +3800,13 @@ function renderAdminPage() {
                 "</div>";
               })() +
             "</td>" +
-            "<td style='color:var(--text-muted);font-size:11px;white-space:nowrap;text-align:center;'>" + item.createdAt + "</td>" +
+            "<td style='color:var(--text-muted);font-size:11px;white-space:nowrap;text-align:center;'>" + escHtml(item.createdAt) + "</td>" +
             "<td style='text-align:right;white-space:nowrap;'>" +
               "<div class='action-group'>" +
-                "<button type='button' class='act-btn act-stat' data-slug='" + item.slug + "'>📊 详情</button>" +
-                "<button type='button' class='act-btn act-edit' data-slug='" + item.slug + "' data-url='" + item.url + "' data-title='" + item.title + "' data-backup='" + (item.backupUrl || "") + "' data-target='" + (item.activeTarget || "primary") + "' data-autoswitched='" + (item.autoSwitched ? "1" : "0") + "' data-lastswitched='" + (item.lastSwitchedAt || "") + "' data-onlymobile='" + (item.onlyMobile ? "1" : "0") + "'>✏️ 编辑</button>" +
-                "<button type='button' class='act-btn act-copy' data-url='" + item.shortUrl + "'>📋 复制</button>" +
-                "<button type='button' class='act-btn act-del' data-slug='" + item.slug + "'>🗑️</button>" +
+                "<button type='button' class='act-btn act-stat' data-slug='" + safeSlug + "'>📊 详情</button>" +
+                "<button type='button' class='act-btn act-edit' data-slug='" + safeSlug + "' data-url='" + safeUrlText + "' data-title='" + safeTitleText + "' data-backup='" + safeBackup + "' data-target='" + escHtml(item.activeTarget || "primary") + "' data-autoswitched='" + (item.autoSwitched ? "1" : "0") + "' data-lastswitched='" + escHtml(item.lastSwitchedAt || "") + "' data-onlymobile='" + (item.onlyMobile ? "1" : "0") + "'>✏️ 编辑</button>" +
+                "<button type='button' class='act-btn act-copy' data-url='" + safeShortUrl + "'>📋 复制</button>" +
+                "<button type='button' class='act-btn act-del' data-slug='" + safeSlug + "'>🗑️</button>" +
               "</div>" +
             "</td>" +
           "</tr>";
@@ -3799,23 +4144,30 @@ function renderAdminPage() {
         for (var i = 0; i < logs.length; i++) {
           var l = logs[i];
           var isOk = l.counted === 1;
+          var reasonText = escHtml(l.reason || "已拦截");
           var statusBadge = isOk 
             ? "<span style='color:#16a34a;background:#dcfce7;padding:1px 6px;border-radius:4px;font-weight:700;'>✅ 真实计入</span>"
-            : "<span style='color:#b45309;background:#fef3c7;padding:1px 6px;border-radius:4px;font-weight:700;'>🚫 " + (l.reason || "已拦截") + "</span>";
+            : (reasonText.indexOf("待页面渲染确认") !== -1
+                ? "<span style='color:#475569;background:#f1f5f9;padding:1px 6px;border-radius:4px;font-weight:700;'>🤖 仅抓HTML(未渲染不计)</span>"
+                : "<span style='color:#b45309;background:#fef3c7;padding:1px 6px;border-radius:4px;font-weight:700;'>🚫 " + reasonText + "</span>");
 
-          var countryTag = l.country ? (" (" + l.country + ")") : "";
-          var shortTime = (l.time || "").slice(5);
+          var countryTag = l.country ? (" (" + escHtml(l.country) + ")") : "";
+          var shortTime = escHtml((l.time || "").slice(5));
+          var safeIp = escHtml(l.ip || "-");
+          var safeDevice = escHtml(l.device || "未知");
+          var safeSource = escHtml(l.source || "direct");
+          var safeUa = escHtml(l.ua || "空");
 
           html += "<div style='padding:7px 10px;border-bottom:1px solid #f1f5f9;display:flex;flex-direction:column;gap:3px;'>" +
             "<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:4px;'>" +
               "<div style='display:flex;align-items:center;gap:6px;'>" +
                 statusBadge +
-                "<strong style='color:#1e293b;font-family:monospace;font-size:11px;'>" + l.ip + countryTag + "</strong>" +
-                "<span style='color:#64748b;font-size:10px;'>" + (l.device || "未知") + " · " + (l.source || "direct") + "</span>" +
+                "<strong style='color:#1e293b;font-family:monospace;font-size:11px;'>" + safeIp + countryTag + "</strong>" +
+                "<span style='color:#64748b;font-size:10px;'>" + safeDevice + " · " + safeSource + "</span>" +
               "</div>" +
               "<span style='color:#94a3b8;font-size:10px;font-family:monospace;'>" + shortTime + "</span>" +
             "</div>" +
-            "<div style='color:#64748b;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + (l.ua || "") + "'>UA: " + (l.ua || "空") + "</div>" +
+            "<div style='color:#64748b;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' title='" + safeUa + "'>UA: " + safeUa + "</div>" +
           "</div>";
         }
         container.innerHTML = html;
